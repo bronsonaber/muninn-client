@@ -57,7 +57,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: bronsonaber/muninn-client@__MUNINN_CLIENT_PIN_SHA__  # pinned: v0.1
+      - uses: bronsonaber/muninn-client@39b416817ea51a782adefdd7e81858444e6b3f46  # pinned: v0.1
         with:
           server-url: 'https://muninn-edge.bronson-aber.workers.dev'
           server-pubkey: ${{ vars.MUNINN_SERVER_PUBKEY }}
