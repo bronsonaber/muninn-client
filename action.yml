@@ -55,7 +55,7 @@ inputs:
     required: false
     default: ${{ github.token }}
   python-version:
-    description: 'Python version used to run Muninn (pure stdlib, no pip install needed).'
+    description: 'Python version used to run Muninn. Server mode installs one dependency (cryptography) for ed25519 signing; local mode is pure stdlib.'
     required: false
     default: '3.12'
   server-url:
@@ -114,6 +114,10 @@ runs:
       uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
       with:
         python-version: ${{ inputs.python-version }}
+
+    - name: Install the signing dependency (server mode)
+      shell: bash
+      run: python3 -m pip install --disable-pip-version-check cryptography==47.0.0
 
     - name: Run Muninn Context Receipt
       shell: bash
