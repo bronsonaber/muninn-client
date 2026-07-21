@@ -119,6 +119,19 @@ runs:
       shell: bash
       run: python3 -m pip install --disable-pip-version-check cryptography==47.0.0
 
+    # shadow/pr_action.py's own check_pinned_ref() self-check runs FIRST,
+    # before anything else: it prints this client's version and the ref
+    # THIS invocation was resolved at (GITHUB_ACTION_REF, set by the runner
+    # itself -- not spoofable via any input here). This job runs with the
+    # calling repo's raw files and secrets BEFORE Muninn's own redaction
+    # step ever fires, so an unpinned `uses:` (a branch or tag, e.g. @main)
+    # means a compromised muninn-client main could swap in different,
+    # unreviewed code for that window with no change to the calling
+    # workflow at all -- the check fails the job on an unpinned ref unless
+    # the calling workflow's own `env:` sets MUNINN_ALLOW_UNPINNED=true (a
+    # documented, not-recommended escape hatch; it still emits a
+    # SECURITY WARNING even when it lets the run continue). See
+    # PROVISIONING.md for the current recommended pinned SHA.
     - name: Run Muninn Context Receipt
       shell: bash
       run: python3 "${{ github.action_path }}/shadow/pr_action.py"

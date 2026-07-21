@@ -57,13 +57,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: bronsonaber/muninn-client@main
+      - uses: bronsonaber/muninn-client@__MUNINN_CLIENT_PIN_SHA__  # pinned: v0.1
         with:
           server-url: 'https://muninn-edge.bronson-aber.workers.dev'
           server-pubkey: ${{ vars.MUNINN_SERVER_PUBKEY }}
           client-key-id: ${{ vars.MUNINN_CLIENT_KEY_ID }}
           client-private-key: ${{ secrets.MUNINN_CLIENT_PRIVATE_KEY_PEM }}
 ```
+
+**Always pin `uses:` to the full commit SHA, never `@main` or a tag.** This
+job runs with access to your repo's raw files and secrets before Muninn's
+own redaction step ever runs, so a mutable ref would let a compromised
+`muninn-client` `main` swap in unreviewed code without any change to your
+own workflow file. `muninn init` (the self-service installer) always writes
+the pinned SHA for you; see
+[PROVISIONING.md](PROVISIONING.md#step-4-wire-it-into-your-workflow) for
+the current recommended SHA, the client's own run-time self-check
+(`check_pinned_ref()` in `shadow/pr_action.py`), and our version-rotation /
+security-bulletin policy.
 
 Before that workflow can produce a receipt, you need a signing key
 registered with the server. See `PROVISIONING.md` for the full self-serve

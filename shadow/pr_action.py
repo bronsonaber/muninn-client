@@ -7,6 +7,17 @@ fingerprint bundle from the repo and hands scoring to a configured server
 (MUNINN_SERVER_URL). If MUNINN_SERVER_URL is not configured, run() exits
 with an error instead of attempting to score anything in this job.
 
+    0. check_pinned_ref()     supply-chain self-check, runs FIRST, before
+                              anything else in run(): is THIS invocation
+                              pinned to an immutable commit SHA (see
+                              GITHUB_ACTION_REF), not a mutable `@main`/tag?
+                              Fails the job on an unpinned ref unless
+                              MUNINN_ALLOW_UNPINNED=true is set. This job
+                              runs with the customer's raw files and repo
+                              secrets BEFORE Muninn's own redaction step
+                              ever fires, so a mutable ref would let a
+                              compromised muninn-client `main` swap in
+                              different, unreviewed code for that window.
     1. detect_ai_authored()   pure decision function: is this PR AI-authored,
                               per a CONFIGURABLE signal (a label, an author
                               glob, or a commit-trailer marker)? No I/O.
@@ -49,6 +60,7 @@ import fnmatch
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 from typing import Any, Dict, Optional, Tuple
@@ -82,6 +94,68 @@ from shadow.gh_client import GitHubClient, upsert_comment  # noqa: E402
 DEFAULT_AI_LABEL = "ai-authored"
 DEFAULT_AI_AUTHOR_GLOB = ""
 DEFAULT_AI_TRAILER = ""
+
+# This client's own version, printed by the pinned-ref self-check below so a
+# customer's job log always says which build actually ran -- independent of
+# whatever `uses:` ref they configured.
+MUNINN_VERSION = "0.1.0"
+
+_SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def check_pinned_ref(action_ref: str, *, allow_unpinned: bool
+                     ) -> Tuple[bool, str]:
+    """The supply-chain self-check (see the HARDENING BACKLOG / stack audit
+    item this closes): a customer's workflow MUST invoke this Action by an
+    immutable commit SHA (`uses: bronsonaber/muninn-client@<40-hex-sha>`),
+    never a mutable branch or tag like `@main`. This job runs with access to
+    the customer's raw files and repo secrets BEFORE Muninn's own redaction
+    step ever fires; a mutable ref means a compromised muninn-client `main`
+    could swap in different, unreviewed code for that window with no change
+    to the customer's own workflow file at all.
+
+    `action_ref` is GITHUB_ACTION_REF -- the ref GitHub itself resolved for
+    THIS invocation of the action (set by the runner, not configurable by
+    the action or its inputs, so it can't be spoofed by anything short of a
+    compromised runner). Pure, no I/O, so it is trivially testable without
+    faking the environment: main() below is the only caller that reads
+    GITHUB_ACTION_REF/MUNINN_ALLOW_UNPINNED from the real environment.
+
+    Returns (ok, message). `ok` is False (the run must fail) whenever
+    `action_ref` is not a 40-character lowercase-hex commit SHA, UNLESS the
+    caller has explicitly set MUNINN_ALLOW_UNPINNED=true -- an escape hatch
+    for local/dev use only, never recommended for a real CI run, which is
+    why it still prints the warning even when it lets the run continue."""
+    ref_label = action_ref or "(empty -- GITHUB_ACTION_REF was not set)"
+    lines = [f"muninn-context-receipt: client version {MUNINN_VERSION}, "
+            f"invoked at ref '{ref_label}'"]
+    if action_ref and _SHA40_RE.match(action_ref):
+        lines.append("muninn-context-receipt: ref is a pinned 40-character "
+                     "commit SHA; supply-chain control satisfied.")
+        return True, "\n".join(lines)
+
+    lines.append(
+        "muninn-context-receipt: SECURITY WARNING: this workflow invokes "
+        f"muninn-client at an UNPINNED ref ('{ref_label}'), not a 40-character "
+        "commit SHA. A branch or tag can be moved -- accidentally, or by a "
+        "compromised maintainer account -- to point at different, "
+        "unreviewed code, which would then run in this job with access to "
+        "this repo's raw files and secrets BEFORE Muninn's redaction step "
+        "ever runs. Pin this input to a commit SHA instead, e.g. "
+        "'uses: bronsonaber/muninn-client@<40-char-sha>  # pinned: vX.Y' -- "
+        "see PROVISIONING.md for the current recommended SHA and our "
+        "security-bulletin/version-rotation policy.")
+    if allow_unpinned:
+        lines.append(
+            "muninn-context-receipt: MUNINN_ALLOW_UNPINNED=true is set; "
+            "continuing despite the unpinned ref. This is NOT recommended "
+            "for a real CI run.")
+        return True, "\n".join(lines)
+    lines.append(
+        "muninn-context-receipt: refusing to run further. Set "
+        "MUNINN_ALLOW_UNPINNED=true to override (not recommended) or, "
+        "correctly, pin `uses:` to a commit SHA.")
+    return False, "\n".join(lines)
 
 
 def detect_ai_authored(pr: Dict[str, Any], commit_message: str, *,
@@ -206,6 +280,7 @@ def run(event: Dict[str, Any], *, workspace: str, repo: str, token: str,
        trailer: str,
        server_url: str = "", server_public_key_pem: bytes = b"",
        client_key_id: str = "", client_private_key_pem: bytes = b"",
+       action_ref: str = "", allow_unpinned: bool = False,
        client_factory=GitHubClient,
        stdout=None) -> int:
     """The testable core: everything main() does, minus reading process
@@ -217,8 +292,19 @@ def run(event: Dict[str, Any], *, workspace: str, repo: str, token: str,
     immediately with a clear error rather than attempting any local
     scoring -- this public client has no scoring engine to fall back to.
     See the module docstring for the two failure postures server mode can
-    hit once a server is configured."""
+    hit once a server is configured.
+
+    The pinned-ref self-check (see check_pinned_ref()) runs FIRST, before
+    anything else -- including the server-url check and the non-AI-authored
+    early-return below -- so an unpinned `uses:` fails the job (or at least
+    warns) on every PR, not only the ones this Action would otherwise have
+    acted on."""
     out = stdout or sys.stdout
+    ref_ok, ref_message = check_pinned_ref(action_ref, allow_unpinned=allow_unpinned)
+    out.write(ref_message + "\n")
+    if not ref_ok:
+        return 1
+
     if not server_url:
         out.write("muninn-context-receipt: ERROR: server-url is required; "
                   "the public client only runs in server mode. Set "
@@ -321,6 +407,13 @@ def main(argv: Optional[list] = None) -> int:
         client_key_id=os.environ.get("MUNINN_CLIENT_KEY_ID", ""),
         client_private_key_pem=os.environ.get(
             "MUNINN_CLIENT_PRIVATE_KEY_PEM", "").encode("utf-8"),
+        # GITHUB_ACTION_REF is set by the runner itself to the ref of THIS
+        # action invocation -- not an input, not something the calling
+        # workflow's `with:` block can spoof. MUNINN_ALLOW_UNPINNED is the
+        # documented, not-recommended escape hatch; see check_pinned_ref().
+        action_ref=os.environ.get("GITHUB_ACTION_REF", ""),
+        allow_unpinned=os.environ.get(
+            "MUNINN_ALLOW_UNPINNED", "").strip().lower() == "true",
     )
 
 

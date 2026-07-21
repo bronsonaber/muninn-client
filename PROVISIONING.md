@@ -107,13 +107,44 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: bronsonaber/muninn-client@main
+      - uses: bronsonaber/muninn-client@__MUNINN_CLIENT_PIN_SHA__  # pinned: v0.1
         with:
           server-url: 'https://muninn-edge.bronson-aber.workers.dev'
           server-pubkey: ${{ vars.MUNINN_SERVER_PUBKEY }}
           client-key-id: ${{ vars.MUNINN_CLIENT_KEY_ID }}
           client-private-key: ${{ secrets.MUNINN_CLIENT_PRIVATE_KEY_PEM }}
 ```
+
+**Always pin `uses:` to a full 40-character commit SHA, never `@main` or a
+version tag.** This job runs with access to your repo's raw files and
+secrets BEFORE Muninn's own redaction step ever fires. A mutable ref means
+that if `muninn-client`'s `main` branch (or a tag) were ever moved --
+accidentally, or by a compromised maintainer account -- to point at
+different, unreviewed code, your CI would start running that code the very
+next time this workflow triggered, with no change to your own workflow
+file at all. A pinned SHA cannot be moved out from under you: bumping it is
+always a deliberate, visible action in your own repo (a diff to this file).
+
+`muninn init` (the self-service installer) always writes the workflow with
+the pinned SHA baked in already; the block above is for anyone wiring this
+by hand or reviewing what `muninn init` generated.
+
+The client's own `check_pinned_ref()` self-check (`shadow/pr_action.py`)
+also enforces this at run time: it reads `GITHUB_ACTION_REF` (set by the
+GitHub Actions runner itself for this invocation, not something your
+`with:` inputs can override) and FAILS the job if it is not a
+40-character commit SHA. If you deliberately need to run against a branch
+or tag for local testing, set `MUNINN_ALLOW_UNPINNED=true` in that job's
+`env:` -- this is a documented escape hatch, not a recommendation, and the
+job still prints a SECURITY WARNING when it is used.
+
+**Version-rotation / security-bulletin policy:** we cut immutable
+`muninn-client` releases (a tagged commit) rather than developing against
+`main` in place. When we ship a fix worth adopting -- especially a
+security fix -- we publish a bulletin naming the new commit SHA; bump the
+pinned SHA in your workflow at that point. There is no "auto-update" by
+design: your CI never changes behavior without your own commit to your
+own workflow file.
 
 `server-url` and `server-pubkey` are exactly the `server_url` /
 `server_pubkey` fields step 2's `/register` response returned (or, under

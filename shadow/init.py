@@ -1,304 +1,492 @@
-"""shadow/init.py, `muninn init`: turn on the evidence faucet for THIS install.
+"""shadow/init.py, `muninn init`: one-command customer onboarding.
 
-The rare compounding value of Muninn is Evidence Mode: a CDR ledger that accrues
-real context-decision records so value-per-token can eventually be proven. Before
-this command that faucet was unreachable by anyone but the maintainer, the hook
-scripts were "coming in Phase 2" and the pipeline was pinned to one laptop. `muninn
-init` makes the faucet a product: one command detects this install's assistant and
-context surfaces, generates real (not placeholder) hook config wired to the CDR
-faucet, derives every path from the USER's own environment, and prints exactly what
-it did and how to verify it.
+`muninn init --invite <INVITE_TOKEN>` is the single-command installer: it
+generates a client signing keypair, self-registers it against a Muninn scoring
+server (POST /register), wires this repo's GitHub Actions secrets/variables via
+`gh`, writes the Context Receipt workflow, and opens the PR that adds it. See
+`_build_parser`, `run_onboard`, and `main` below.
 
-  muninn init --assistant <claude|cursor|codex> --vault <path> --repo .
-  muninn init --check        # confirm CDRs are actually being captured here
+  muninn init --invite <INVITE_TOKEN> [--server-url URL] [--repo OWNER/REPO]
+              [--branch NAME] [--no-pr]
 
-Auto-detection fills in any flag left off (assistant from surfaces, vault from the
-user's home, corpus from the assistant's transcript layout). It writes only under
-the ledger dir it reports; it never edits the user's live assistant settings and
-never touches the vault. Pure stdlib, deterministic, utf-8, no em dashes.
+The private key is generated locally and is sent nowhere except into a GitHub
+secret (over stdin, via `gh secret set`) -- never in the /register payload,
+never in subprocess argv, never printed to stdout -- and is deleted from disk
+before this command returns, on every path past its own creation (success or
+failure).
+
+This module used to also answer to `muninn init` for a second, unrelated
+feature: the evidence-faucet CDR-capture installer (`--assistant/--vault/
+--check`). The two shared no flag name and no code beyond stdlib imports and
+`shadow.signing.generate_keypair`; `main()` used to peek argv for `--invite`
+to tell them apart. That collision is resolved: the evidence faucet is now
+`muninn faucet` (see shadow/faucet.py), and `muninn init` means onboarding
+only.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
+import shutil
 import stat
+import subprocess
 import sys
+import urllib.error
+import urllib.request
 from typing import Any, Dict, List, Optional, Sequence
 
 _here = pathlib.Path(__file__).parent
 if str(_here.parent) not in sys.path:
     sys.path.insert(0, str(_here.parent))
 
-from shadow import capture  # noqa: E402
-from shadow import cdr as cdrlib  # noqa: E402
-from shadow import context_inventory as inv  # noqa: E402
-
-REPO_ROOT = _here.parent  # the muninn checkout this command runs from
+from shadow import signing  # noqa: E402
 
 
-# ── surface + corpus detection (reuses Wave 2a inventory) ──────────────────────
+# ── customer onboarding (`muninn init --invite <token>`) ───────────────────────
 
-def detect_surfaces(config: capture.CaptureConfig) -> Dict[str, Any]:
-    """Detect context surfaces under the repo and vault (Wave 2a coverage map).
+DEFAULT_SERVER_URL = "https://muninn-edge.bronson-aber.workers.dev"
+DEFAULT_ONBOARD_BRANCH = "muninn-setup"
 
-    Nothing is scanned/audited here, init only INVENTORIES which surfaces are
-    present so the summary can name them, exactly as `muninn inventory` classifies.
-    """
-    roots = []
-    for r in (config.repo, config.vault):
-        rp = pathlib.Path(r)
-        if rp.is_dir() and rp not in roots:
-            roots.append(rp)
-    surfaces: List[Any] = []
-    for root in roots:
-        try:
-            surfaces.extend(inv.detect_surfaces(root, scanned_paths=set()))
-        except Exception:
-            continue
-    # De-duplicate by (surface_type, pointer).
-    seen = set()
-    uniq = []
-    for s in surfaces:
-        key = (s.surface_type, s.pointer)
-        if key in seen:
-            continue
-        seen.add(key)
-        uniq.append({"surface_type": s.surface_type, "label": s.label,
-                     "pointer": s.pointer})
-    uniq.sort(key=lambda d: (d["surface_type"], d["pointer"]))
-    return {"count": len(uniq), "surfaces": uniq}
+# Pinned to an immutable commit SHA, not the floating `main` branch: a
+# customer's workflow runs this action with access to their raw files and
+# secrets BEFORE Muninn's own redaction step ever fires. A mutable ref
+# (`@main`, `@v1`, etc.) means a compromised muninn-client `main` could run
+# changed, unreviewed code in that window with no change to this file at
+# all. THE ONE PLACE to bump on a future muninn-client release: update
+# MUNINN_CLIENT_REF (and its version comment) here, nowhere else -- both
+# CLIENT_ACTION_REF and the generated workflow derive from it.
+MUNINN_CLIENT_REF = "386f2956925b0ea2cebfdfb3c3e8e041339df9ec"  # muninn-client v0.1 (2026-07-21)
+MUNINN_CLIENT_VERSION_LABEL = "v0.1"
+CLIENT_ACTION_REF = f"bronsonaber/muninn-client@{MUNINN_CLIENT_REF}"
+WORKFLOW_RELPATH = ".github/workflows/muninn.yml"
+PRIVATE_KEY_FILENAME = ".muninn_client_key.pem"  # local only; deleted before exit
+ONBOARD_USER_AGENT = "muninn-init/1.0"
+ONBOARD_TIMEOUT_SECONDS = 15.0
+COMMIT_MESSAGE = "Add Muninn Context Receipt workflow"
+PR_TITLE = "Add Muninn Context Receipt"
 
 
-# ── hook config generation (the real, no-longer-Phase-2 artifacts) ─────────────
-
-def _write(path: pathlib.Path, text: str, *, executable: bool = False) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
-    if executable:
-        mode = path.stat().st_mode
-        path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-
-
-def _hook_wrapper(config: capture.CaptureConfig) -> str:
-    """A tiny, self-contained hook wrapper. Derived paths only, no personal paths."""
-    return (
-        "#!/usr/bin/env bash\n"
-        "# GENERATED by `muninn init`, the evidence faucet hook wrapper.\n"
-        "# Maps a Claude Code hook payload (stdin JSON) to a captured CDR.\n"
-        "# Fail-safe: a capture fault exits 0 so it can never break a session.\n"
-        "set -uo pipefail\n"
-        f'MUNINN_REPO="${{MUNINN_REPO:-{config.repo}}}"\n'
-        f'MUNINN_VAULT="${{MUNINN_VAULT:-{config.vault}}}"\n'
-        f'MUNINN_LEDGER_DIR="${{MUNINN_LEDGER_DIR:-{config.ledger_dir}}}"\n'
-        f'MUNINN_ASSISTANT="${{MUNINN_ASSISTANT:-{config.assistant}}}"\n'
-        'export MUNINN_VAULT MUNINN_LEDGER_DIR MUNINN_ASSISTANT\n'
-        'PYTHONPATH="$MUNINN_REPO${PYTHONPATH:+:$PYTHONPATH}" \\\n'
-        '  "${PYTHON:-python3}" -m shadow.capture --from-hook \\\n'
-        f'    --assistant "$MUNINN_ASSISTANT" --vault "$MUNINN_VAULT" \\\n'
-        f'    --ledger-dir "$MUNINN_LEDGER_DIR" --privacy {config.privacy_mode} \\\n'
-        '  || true\n'
-    )
+class OnboardError(Exception):
+    """A user-facing, already-actionable onboarding failure. `run_onboard`
+    catches this exactly once, prints str(exc) verbatim (already
+    plain-English, already says what to do about it), and returns 1. A
+    first-run failure must read as a fixable config issue, never a raw
+    traceback -- every raise site below writes the fix, not just the
+    symptom."""
 
 
-def _claude_settings_fragment(hook_cmd: str) -> str:
-    """The Claude Code settings.json hooks block to merge (a Read PostToolUse hook)."""
-    block = {
-        "hooks": {
-            "PostToolUse": [
-                {
-                    "matcher": "Read",
-                    "hooks": [
-                        {"type": "command", "command": hook_cmd}
-                    ],
-                }
-            ]
-        }
-    }
-    return json.dumps(block, indent=2) + "\n"
-
-
-def _env_file(config: capture.CaptureConfig) -> str:
-    """The per-user pipeline env file, de-hardcodes ops/muninn_daily.sh.
-
-    Source this (or point MUNINN_ENV at it) and the daily pipeline runs against
-    THIS user's repo/vault/corpus. Every value is derived from the user's own
-    environment; no maintainer path appears.
-    """
-    return (
-        "# GENERATED by `muninn init`, per-user Muninn pipeline paths.\n"
-        "# Source this file, or set MUNINN_ENV to its path, before the daily run.\n"
-        f'export MUNINN_REPO="{config.repo}"\n'
-        f'export MUNINN_VAULT="{config.vault}"\n'
-        f'export MUNINN_CORPUS="{config.corpus}"\n'
-        f'export MUNINN_LEDGER_DIR="{config.ledger_dir}"\n'
-        f'export MUNINN_ASSISTANT="{config.assistant}"\n'
-    )
-
-
-def _install_readme(config: capture.CaptureConfig, hooks_dir: pathlib.Path,
-                    hook_wrapper: pathlib.Path, verify_cmd: str) -> str:
-    return (
-        "# Muninn evidence faucet, generated install\n\n"
-        "`muninn init` generated the files in this directory. They capture one\n"
-        "Context Decision Record per memory-read event your assistant makes, so a\n"
-        "CDR ledger accrues while you work. Nothing here was hand-edited; re-run\n"
-        "`muninn init` to regenerate.\n\n"
-        "## What was generated\n\n"
-        f"- `{hook_wrapper.name}`, the hook wrapper (maps a hook payload to a CDR).\n"
-        "- `claude_settings.hooks.json`, the settings block to wire the hook in\n"
-        "  (Claude Code). Merge its `hooks` key into your Claude settings.\n"
-        "- `muninn.env`, per-user pipeline paths for the optional daily batch run.\n\n"
-        "## Wire the live hook (Claude Code)\n\n"
-        "Merge `claude_settings.hooks.json`'s `hooks` block into your Claude Code\n"
-        "settings (project `.claude/settings.json` or the user settings). The hook\n"
-        "runs on every `Read`; it captures only reads of files under your vault, so\n"
-        "ordinary source reads never inflate the ledger.\n\n"
-        "## Where CDRs land\n\n"
-        f"    {config.cdrs_path}\n\n"
-        "## Verify it is working\n\n"
-        f"    {verify_cmd}\n"
-    )
-
-
-def generate_hook_config(config: capture.CaptureConfig) -> Dict[str, Any]:
-    """Generate the real hook config + pipeline env under the ledger dir.
-
-    Returns a manifest of what was written. Every embedded path is derived from
-    the user's environment; no maintainer path is emitted.
-    """
-    ledger = pathlib.Path(config.ledger_dir)
-    hooks_dir = ledger / "hooks"
-    wrapper = hooks_dir / "muninn_capture.sh"
-    settings = hooks_dir / "claude_settings.hooks.json"
-    env_file = ledger / "muninn.env"
-    readme = hooks_dir / "INSTALL.md"
-
-    _write(wrapper, _hook_wrapper(config), executable=True)
-    _write(settings, _claude_settings_fragment(str(wrapper)))
-    _write(env_file, _env_file(config))
-    verify_cmd = f"muninn init --check --ledger-dir {config.ledger_dir}"
-    _write(readme, _install_readme(config, hooks_dir, wrapper, verify_cmd))
-
-    return {
-        "hooks_dir":    str(hooks_dir),
-        "hook_wrapper": str(wrapper),
-        "settings_fragment": str(settings),
-        "env_file":     str(env_file),
-        "install_readme": str(readme),
-    }
-
-
-# ── verification (`muninn init --check`) ───────────────────────────────────────
-
-def verify_install(config: capture.CaptureConfig) -> Dict[str, Any]:
-    """Confirm the faucet works for THIS install, two ways:
-
-      1. MACHINERY self-probe: push a synthetic capture event through the faucet
-         into a throwaway ledger and assert a schema-valid CDR comes out. This
-         proves the capture path is wired correctly on this machine right now,
-         even before any real event has fired.
-      2. LEDGER accrual: report how many CDRs the configured ledger actually holds
-         (total, valid, memory-joined, latest timestamp).
-
-    Returns a report dict; healthy iff the machinery probe produced a valid CDR.
-    """
-    import tempfile
-
-    # 1. machinery self-probe (isolated ledger; never touches the real one).
-    probe_ok = False
-    probe_detail = ""
+def _run(cmd: List[str], *, cwd: Optional[str] = None,
+        input_text: Optional[str] = None,
+        timeout: float = 30.0) -> "subprocess.CompletedProcess[str]":
+    """The one subprocess seam `git`/`gh` calls funnel through, so a test can
+    intercept ALL of them by monkeypatching `subprocess.run` alone. Never
+    raises for a nonzero exit (the caller decides what that means); a
+    transport-level failure (binary not found, timeout) is folded into a
+    synthetic nonzero CompletedProcess instead, so every call site has one
+    shape to check."""
     try:
-        with tempfile.TemporaryDirectory() as td:
-            probe_cfg = capture.CaptureConfig(
-                assistant=config.assistant, repo=config.repo, vault=config.vault,
-                corpus=config.corpus, ledger_dir=td,
-                cdrs_path=str(pathlib.Path(td) / "cdrs.jsonl"),
-                privacy_mode=config.privacy_mode, supported=config.supported)
-            event = {
-                "session_id": "muninn-init-check",
-                "turn_id":    "probe",
-                "memory_id":  "self-probe-memory",
-                "ts":         "1970-01-01T00:00:00Z",
-                "source":     "init_check",
-                "event_type": "probe",
-            }
-            res = capture.capture_event(event, probe_cfg)
-            probe_ok = bool(res.get("valid") and res.get("written"))
-            probe_detail = f"faucet produced a valid CDR ({res.get('cdr_id')})"
-    except Exception as e:
-        probe_detail = f"faucet probe FAILED: {e}"
-
-    # 2. real-ledger accrual status.
-    cdrs = cdrlib.load_cdrs(pathlib.Path(config.cdrs_path))
-    valid = sum(1 for c in cdrs if not cdrlib.validate_cdr(c))
-    joined = sum(1 for c in cdrs if cdrlib.has_memory_join(c))
-    latest = max((str(c.get("timestamp") or "") for c in cdrs), default="")
-
-    return {
-        "machinery_ok":  probe_ok,
-        "machinery_detail": probe_detail,
-        "cdrs_path":     config.cdrs_path,
-        "cdrs_total":    len(cdrs),
-        "cdrs_valid":    valid,
-        "cdrs_memory_joined": joined,
-        "latest_timestamp": latest,
-        "supported":     config.supported,
-        "assistant":     config.assistant,
-    }
+        return subprocess.run(cmd, cwd=cwd, input=input_text,
+                             capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return subprocess.CompletedProcess(cmd, 127, "", str(exc))
 
 
-# ── summary rendering ──────────────────────────────────────────────────────────
+def _gh_detail(proc: "subprocess.CompletedProcess[str]") -> str:
+    return (proc.stderr or proc.stdout or "").strip()
 
-def render_summary(config: capture.CaptureConfig, surfaces: Dict[str, Any],
-                   manifest: Dict[str, Any], verify_cmd: str) -> str:
-    L = ["=" * 64, "  muninn init, evidence faucet configured", "=" * 64,
-         f"  assistant        : {config.assistant}"
-         + ("" if config.supported else "  (surfaces only; live capture not yet "
-                                        "supported for this assistant)"),
-         f"  repo             : {config.repo}",
-         f"  vault            : {config.vault}",
-         f"  transcript source: {config.corpus}"
-         + ("  [present]" if pathlib.Path(config.corpus).exists()
-            else "  [not present yet]"),
-         f"  privacy mode     : {config.privacy_mode}",
-         "",
-         f"  context surfaces detected: {surfaces['count']}"]
-    for s in surfaces["surfaces"][:12]:
-        L.append(f"    - [{s['label']}] {s['pointer']}")
-    if surfaces["count"] > 12:
-        L.append(f"    ... and {surfaces['count'] - 12} more")
-    L += [
-        "",
-        f"  hook config      : {manifest['hooks_dir']}",
-        f"  settings block   : {manifest['settings_fragment']}",
-        f"  pipeline env     : {manifest['env_file']}",
-        f"  CDR ledger (out) : {config.cdrs_path}",
-        "",
-        "  verify with:",
-        f"    {verify_cmd}",
+
+def _gh_error(detail: str, generic: str) -> OnboardError:
+    """One SSO-aware error path shared by every `gh` call site below. A
+    GitHub org that requires SSO authorization for a token produces a
+    distinct, greppable message from `gh` itself; surfaced as its own fix
+    rather than folded into a generic auth failure, since the fix (visit
+    github.com/settings/tokens, click 'Enable SSO') is different from
+    `gh auth login`."""
+    if "sso" in detail.lower():
+        return OnboardError(
+            "GitHub rejected this because your organization requires SSO "
+            "authorization for this token.\n"
+            "  fix: open https://github.com/settings/tokens, click 'Enable "
+            "SSO' next to the token gh is using, authorize it for the "
+            "organization, then re-run.\n"
+            f"  (gh said: {detail})")
+    return OnboardError(f"{generic}\n  (gh said: {detail})" if detail else generic)
+
+
+def _check_git_repo(cwd: str) -> None:
+    proc = _run(["git", "rev-parse", "--is-inside-work-tree"], cwd=cwd)
+    if proc.returncode != 0 or proc.stdout.strip() != "true":
+        raise OnboardError(
+            "not inside a git repository.\n"
+            "  fix: cd into your project's git repo (or run `git init`), "
+            "then re-run `muninn init --invite <token>`.")
+
+
+def _check_gh_installed() -> None:
+    if shutil.which("gh") is None:
+        raise OnboardError(
+            "the GitHub CLI ('gh') is not installed.\n"
+            "  fix: install it from https://cli.github.com/ and re-run.")
+
+
+def _check_gh_authed(cwd: str) -> None:
+    proc = _run(["gh", "auth", "status"], cwd=cwd)
+    if proc.returncode != 0:
+        detail = _gh_detail(proc)
+        raise _gh_error(detail, "gh is not authenticated.\n"
+                                "  fix: run `gh auth login` and re-run.")
+
+
+def _resolve_repo(cwd: str, repo_override: Optional[str]) -> str:
+    if repo_override:
+        slug = repo_override.strip()
+    else:
+        proc = _run(["gh", "repo", "view", "--json", "nameWithOwner",
+                     "-q", ".nameWithOwner"], cwd=cwd)
+        if proc.returncode != 0:
+            remote_proc = _run(["git", "remote", "-v"], cwd=cwd)
+            if not (remote_proc.stdout or "").strip():
+                raise OnboardError(
+                    "this repo has no GitHub remote configured.\n"
+                    "  fix: add one, e.g. `git remote add origin "
+                    "git@github.com:<owner>/<repo>.git`, then re-run. Or "
+                    "pass --repo <owner>/<repo> explicitly.")
+            raise _gh_error(
+                _gh_detail(proc),
+                "could not determine which GitHub repo this checkout maps "
+                "to (ambiguous remote, or part of a monorepo with multiple "
+                "GitHub remotes).\n"
+                "  fix: pass --repo <owner>/<repo> explicitly.")
+        slug = proc.stdout.strip()
+    if "/" not in slug or slug.startswith("/") or slug.endswith("/"):
+        raise OnboardError(
+            f"'--repo {slug}' is not a valid OWNER/REPO slug.\n"
+            "  fix: pass --repo in the form <owner>/<repo>.")
+    return slug
+
+
+def _check_push_access(cwd: str, repo_slug: str) -> None:
+    proc = _run(["gh", "repo", "view", repo_slug, "--json", "viewerPermission",
+                "-q", ".viewerPermission"], cwd=cwd)
+    if proc.returncode != 0:
+        raise _gh_error(_gh_detail(proc),
+                        f"could not look up your permissions on "
+                        f"'{repo_slug}'.")
+    perm = proc.stdout.strip().upper()
+    if perm not in ("WRITE", "MAINTAIN", "ADMIN"):
+        raise OnboardError(
+            f"you do not have push access to '{repo_slug}' (permission: "
+            f"{perm or 'NONE'}).\n"
+            "  fix: ask a repo admin to grant you write access, or run "
+            "this against a repository you can push to.")
+
+
+def _default_branch(cwd: str, repo_slug: str) -> str:
+    proc = _run(["gh", "repo", "view", repo_slug, "--json", "defaultBranchRef",
+                "-q", ".defaultBranchRef.name"], cwd=cwd)
+    if proc.returncode != 0:
+        raise _gh_error(_gh_detail(proc),
+                        f"could not determine the default branch for "
+                        f"'{repo_slug}'.")
+    return proc.stdout.strip()
+
+
+def _register(server_url: str, invite: str, key_id: str, public_pem: str,
+              timeout: float = ONBOARD_TIMEOUT_SECONDS) -> Dict[str, Any]:
+    """POST {enrollment_token, key_id, public_key_pem} to <server>/register.
+    Only the PUBLIC key ever leaves this machine -- the caller passes
+    public_pem, never private_pem, and nothing here has a private key to
+    leak. Returns the parsed 200 response
+    (server_url/server_pubkey/dashboard_url/dashboard_token). Raises
+    OnboardError, with the server's own rejection message surfaced, for
+    anything else: an unreachable server, a non-200 response (invalid,
+    expired, or already-used invite; duplicate key_id; malformed pubkey),
+    or a 200 response missing an expected field."""
+    url = server_url.rstrip("/") + "/register"
+    body = json.dumps({
+        "enrollment_token": invite,
+        "key_id": key_id,
+        "public_key_pem": public_pem,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=body, method="POST",
+        headers={"Content-Type": "application/json",
+                "User-Agent": ONBOARD_USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status, raw = resp.status, resp.read()
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        try:
+            raw = exc.read()
+        except Exception:
+            raw = b""
+    except Exception as exc:
+        raise OnboardError(
+            f"could not reach the Muninn server at {server_url}: {exc}\n"
+            "  fix: check your network connection and the --server-url / "
+            "MUNINN_SERVER_URL value, then re-run. Nothing was registered, "
+            "committed, or pushed.")
+
+    try:
+        parsed = json.loads(raw.decode("utf-8")) if raw else {}
+    except (UnicodeDecodeError, ValueError):
+        parsed = {}
+
+    if status != 200:
+        message = parsed.get("error") if isinstance(parsed, dict) else None
+        message = message or f"server returned HTTP {status}"
+        raise OnboardError(
+            f"registration failed: {message}.\n"
+            "  fix: if the invite token is invalid, expired, or already "
+            "used, ask us for a fresh one and re-run with --invite <new "
+            "token>. Nothing was committed or pushed; re-running is safe.")
+
+    if not isinstance(parsed, dict):
+        raise OnboardError(
+            "registration succeeded but the server's response was not a "
+            "JSON object; this looks like a server-side problem, not "
+            "something to fix locally. Contact us with this message.")
+    for field in ("server_url", "server_pubkey", "dashboard_url", "dashboard_token"):
+        if field not in parsed:
+            raise OnboardError(
+                "registration succeeded but the server's response was "
+                f"missing '{field}'; this looks like a server-side problem, "
+                "not something to fix locally. Contact us with this "
+                "message.")
+    return parsed
+
+
+def _gh_secret_set(name: str, value: str, repo_slug: str, cwd: str) -> None:
+    """Sets a repo secret by piping `value` on stdin (never as a CLI
+    argument) so it never appears in this process's own argv/`ps` output --
+    the same discipline the private key file already gets (never printed,
+    never logged)."""
+    proc = _run(["gh", "secret", "set", name, "--repo", repo_slug], cwd=cwd,
+               input_text=value)
+    if proc.returncode != 0:
+        raise _gh_error(_gh_detail(proc), f"failed to set repo secret '{name}'.")
+
+
+def _gh_variable_set(name: str, value: str, repo_slug: str, cwd: str) -> None:
+    proc = _run(["gh", "variable", "set", name, "--repo", repo_slug], cwd=cwd,
+               input_text=value)
+    if proc.returncode != 0:
+        raise _gh_error(_gh_detail(proc), f"failed to set repo variable '{name}'.")
+
+
+def _render_workflow(server_url: str) -> str:
+    return (
+        "name: Muninn Context Receipt\n"
+        "\n"
+        "on: pull_request\n"
+        "\n"
+        "permissions:\n"
+        "  pull-requests: write\n"
+        "  contents: read\n"
+        "\n"
+        "jobs:\n"
+        "  context-receipt:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - uses: actions/checkout@v4\n"
+        "      # Pinned to an immutable commit SHA, not @main: this job runs\n"
+        "      # with access to this repo's raw files and secrets BEFORE\n"
+        "      # Muninn's own redaction step ever fires, so a mutable ref\n"
+        "      # would let a compromised muninn-client `main` run changed,\n"
+        "      # unreviewed code in that window. Bump only on a Muninn\n"
+        "      # security bulletin / release advisory -- see\n"
+        "      # muninn-server/PROVISIONING.md.\n"
+        f"      - uses: {CLIENT_ACTION_REF}  # pinned: {MUNINN_CLIENT_VERSION_LABEL}\n"
+        "        with:\n"
+        f"          server-url: '{server_url}'\n"
+        "          server-pubkey: ${{ vars.MUNINN_SERVER_PUBKEY }}\n"
+        "          client-key-id: ${{ vars.MUNINN_CLIENT_KEY_ID }}\n"
+        "          client-private-key: ${{ secrets.MUNINN_CLIENT_PRIVATE_KEY_PEM }}\n"
+    )
+
+
+def _pr_body(dashboard_url: str) -> str:
+    return (
+        "Adds the Muninn Context Receipt GitHub Action to this repo.\n\n"
+        "On every pull request, Muninn posts a redacted context audit as a "
+        "PR comment (never a code-quality or security approval). This PR "
+        "is itself the first thing Muninn will comment on.\n\n"
+        f"Context Health dashboard: {dashboard_url}\n"
+    )
+
+
+def _git_create_branch(cwd: str, branch: str) -> None:
+    proc = _run(["git", "checkout", "-b", branch], cwd=cwd)
+    if proc.returncode == 0:
+        return
+    # branch may already exist locally from a prior --no-pr run; reuse it.
+    proc2 = _run(["git", "checkout", branch], cwd=cwd)
+    if proc2.returncode != 0:
+        raise OnboardError(
+            f"failed to create or check out branch '{branch}'.\n"
+            f"  (git said: {(proc.stderr or proc.stdout or '').strip()})")
+
+
+def _git_commit(cwd: str, paths: List[str], message: str) -> None:
+    proc = _run(["git", "add", *paths], cwd=cwd)
+    if proc.returncode != 0:
+        raise OnboardError(
+            f"failed to stage {paths}.\n"
+            f"  (git said: {(proc.stderr or proc.stdout or '').strip()})")
+    proc2 = _run(["git", "commit", "-m", message], cwd=cwd)
+    if proc2.returncode != 0:
+        raise OnboardError(
+            "failed to commit the Muninn workflow.\n"
+            f"  (git said: {(proc2.stderr or proc2.stdout or '').strip()})")
+
+
+def _git_push(cwd: str, branch: str) -> None:
+    proc = _run(["git", "push", "-u", "origin", branch], cwd=cwd)
+    if proc.returncode != 0:
+        raise OnboardError(
+            f"failed to push branch '{branch}'.\n"
+            f"  (git said: {(proc.stderr or proc.stdout or '').strip()})")
+
+
+def _gh_pr_create(cwd: str, repo_slug: str, branch: str, title: str,
+                  body: str) -> str:
+    proc = _run(["gh", "pr", "create", "--repo", repo_slug, "--head", branch,
+                "--title", title, "--body", body], cwd=cwd)
+    if proc.returncode != 0:
+        raise _gh_error(_gh_detail(proc), "failed to open the pull request.")
+    return proc.stdout.strip()
+
+
+def _render_onboard_success(repo_slug: str, key_id: str, reg: Dict[str, Any],
+                            pr_url: Optional[str], no_pr: bool,
+                            branch: str) -> str:
+    L = [
         "=" * 64,
+        "  muninn init: onboarding complete",
+        "=" * 64,
+        f"  repo             : {repo_slug}",
+        f"  key_id           : {key_id}",
+        f"  server url       : {reg['server_url']}",
+        f"  dashboard        : {reg['dashboard_url']}",
+        f"  dashboard token  : {reg['dashboard_token']}",
+        "                     (shown once, save it now -- use it as "
+        "'Authorization: Bearer <token>' against the dashboard URL above)",
     ]
-    return "\n".join(L) + "\n"
-
-
-def render_check(report: Dict[str, Any]) -> str:
-    ok = "OK" if report["machinery_ok"] else "FAILED"
-    L = ["=" * 64, f"  muninn init --check, faucet health: {ok}", "=" * 64,
-         f"  assistant        : {report['assistant']}"
-         + ("" if report["supported"] else "  (live capture not yet supported)"),
-         f"  machinery        : {report['machinery_detail']}",
-         f"  CDR ledger       : {report['cdrs_path']}",
-         f"  CDRs accrued     : {report['cdrs_total']} "
-         f"({report['cdrs_valid']} valid, {report['cdrs_memory_joined']} "
-         f"memory-joined)",
-         f"  latest CDR       : {report['latest_timestamp'] or '(none yet)'}"]
-    if report["cdrs_total"] == 0:
-        L.append("  note             : no CDRs captured yet. The machinery is "
-                 "ready; they accrue as your assistant reads vault memory with "
-                 "the hook installed.")
+    if no_pr:
+        L += [
+            "",
+            f"  branch '{branch}' committed locally; no PR opened (--no-pr).",
+            "  next steps:",
+            f"    git push -u origin {branch}",
+            f"    gh pr create --repo {repo_slug} --head {branch} "
+            f"--title \"{PR_TITLE}\"",
+        ]
+    else:
+        L += ["", f"  pull request     : {pr_url}"]
     L.append("=" * 64)
     return "\n".join(L) + "\n"
+
+
+def run_onboard(*, invite: str, server_url: Optional[str] = None,
+                repo_override: Optional[str] = None,
+                branch: str = DEFAULT_ONBOARD_BRANCH, no_pr: bool = False,
+                cwd: Optional[str] = None, stdout=None,
+                env: Optional[Dict[str, str]] = None) -> int:
+    """The testable core of `muninn init --invite <token>`. Runs preflight,
+    generates a keypair locally, registers the PUBLIC key with the server,
+    wires this repo's GitHub secret/variables via `gh`, writes the workflow,
+    and commits (+ pushes + opens a PR, unless no_pr). The private key file
+    is always deleted before returning, on every path past its own creation
+    (success or failure) -- see the `finally` block below.
+
+    Returns 0 on success, 1 on any OnboardError (already-actionable message
+    written to `stdout`, no raw traceback). Any other exception is a real
+    bug and is allowed to propagate."""
+    out = stdout or sys.stdout
+    cwd = cwd or os.getcwd()
+    env = env if env is not None else os.environ
+    server_url = server_url or env.get("MUNINN_SERVER_URL") or DEFAULT_SERVER_URL
+
+    private_key_path: Optional[pathlib.Path] = None
+    try:
+        # 1. PREFLIGHT -- fail early, before anything is generated or sent.
+        _check_git_repo(cwd)
+        _check_gh_installed()
+        _check_gh_authed(cwd)
+        repo_slug = _resolve_repo(cwd, repo_override)
+        _check_push_access(cwd, repo_slug)
+        default_branch = _default_branch(cwd, repo_slug)
+        if branch == default_branch:
+            raise OnboardError(
+                f"--branch must not be the repository's default branch "
+                f"('{default_branch}').\n"
+                "  fix: choose a different branch name, e.g. --branch "
+                f"{DEFAULT_ONBOARD_BRANCH}.")
+
+        # 2. GENERATE KEYPAIR locally. The private key never leaves this
+        # function except as a GitHub secret (step 4, over stdin, via gh);
+        # it is never logged, never printed, never part of the /register
+        # payload (step 3 sends only kp.public_pem).
+        kp = signing.generate_keypair()
+        private_key_path = pathlib.Path(cwd) / PRIVATE_KEY_FILENAME
+        if private_key_path.exists():
+            raise OnboardError(
+                f"refusing to overwrite existing file '{private_key_path}'.\n"
+                "  fix: move or delete it, then re-run.")
+        private_key_path.write_bytes(kp.private_pem)
+        try:
+            private_key_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+        except OSError:
+            pass
+
+        # 3. REGISTER the PUBLIC key only.
+        reg = _register(server_url, invite, kp.key_id,
+                        kp.public_pem.decode("ascii"))
+
+        # 4. WIRE GITHUB: private key -> secret (stdin only), key_id +
+        # server pubkey -> plain repo variables (not sensitive).
+        _gh_secret_set("MUNINN_CLIENT_PRIVATE_KEY_PEM",
+                       private_key_path.read_text(encoding="ascii"),
+                       repo_slug, cwd)
+        _gh_variable_set("MUNINN_CLIENT_KEY_ID", kp.key_id, repo_slug, cwd)
+        _gh_variable_set("MUNINN_SERVER_PUBKEY", reg["server_pubkey"],
+                         repo_slug, cwd)
+
+        # 5. WRITE the workflow.
+        workflow_path = pathlib.Path(cwd) / WORKFLOW_RELPATH
+        workflow_path.parent.mkdir(parents=True, exist_ok=True)
+        workflow_path.write_text(_render_workflow(reg["server_url"]),
+                                 encoding="utf-8")
+
+        # 6. COMMIT + PR (or --no-pr: local branch only).
+        _git_create_branch(cwd, branch)
+        _git_commit(cwd, [WORKFLOW_RELPATH], COMMIT_MESSAGE)
+        pr_url: Optional[str] = None
+        if not no_pr:
+            _git_push(cwd, branch)
+            pr_url = _gh_pr_create(cwd, repo_slug, branch, PR_TITLE,
+                                   _pr_body(reg["dashboard_url"]))
+
+    except OnboardError as exc:
+        out.write(f"muninn init: {exc}\n")
+        return 1
+    finally:
+        # 7. FINISH: the private key file has served its only purpose (being
+        # read into a GitHub secret) or the run failed after it was written;
+        # either way it must not linger on disk as plaintext.
+        if private_key_path is not None:
+            try:
+                if private_key_path.exists():
+                    private_key_path.unlink()
+            except OSError:
+                pass
+
+    out.write(_render_onboard_success(repo_slug, kp.key_id, reg, pr_url,
+                                      no_pr, branch))
+    return 0
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
@@ -306,78 +494,33 @@ def render_check(report: Dict[str, Any]) -> str:
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="muninn init",
-        description="Configure the Muninn evidence faucet: detect this install's "
-                    "assistant + context surfaces, generate real capture-hook "
-                    "config, and print how to verify it. Writes only under the "
-                    "ledger dir; never edits your assistant settings or vault.")
-    p.add_argument("--assistant", default=None,
-                   choices=sorted(capture.KNOWN_ASSISTANTS),
-                   help="claude|cursor|codex (auto-detected from surfaces if omitted)")
-    p.add_argument("--vault", default=None, help="memory vault dir (auto-detected)")
-    p.add_argument("--repo", default=None, help="repo / working dir (default: cwd)")
-    p.add_argument("--corpus", default=None, help="transcript corpus dir (derived)")
-    p.add_argument("--ledger-dir", default=None,
-                   help="Muninn state dir holding cdrs.jsonl (default: ~/.muninn)")
-    p.add_argument("--privacy", default="standard",
-                   choices=sorted(capture.PRIVACY_MODES),
-                   help="standard stores memory ids; strict hashes them")
-    p.add_argument("--check", action="store_true",
-                   help="verify CDRs are being captured for this install (no writes "
-                        "to the hook config)")
-    p.add_argument("--dry-run", action="store_true",
-                   help="print what init would detect/generate without writing")
-    p.add_argument("--json", action="store_true", help="emit the report as JSON")
+        description="One-command Muninn onboarding: generate a client "
+                    "signing keypair, self-register it with a Muninn "
+                    "scoring server, wire this repo's GitHub Actions "
+                    "secrets/variables, write the Context Receipt "
+                    "workflow, and open the PR that adds it.")
+    p.add_argument("--invite", required=True,
+                   help="one-time enrollment invite token")
+    p.add_argument("--server-url", default=None,
+                   help=f"Muninn server origin (default: {DEFAULT_SERVER_URL}, "
+                        "or $MUNINN_SERVER_URL)")
+    p.add_argument("--repo", default=None,
+                   help="explicit GitHub OWNER/REPO, for monorepos or when "
+                        "this checkout's remote is ambiguous")
+    p.add_argument("--branch", default=DEFAULT_ONBOARD_BRANCH,
+                   help=f"branch name for the setup commit (default: "
+                        f"{DEFAULT_ONBOARD_BRANCH})")
+    p.add_argument("--no-pr", action="store_true",
+                   help="commit the workflow to a local branch only; do "
+                        "not push or open a PR")
     return p
 
 
 def main(argv: Optional[Sequence[str]] = None, stdout=None) -> int:
     args = _build_parser().parse_args(argv)
-    out = stdout or sys.stdout
-
-    config = capture.resolve_config(
-        assistant=args.assistant, repo=args.repo, vault=args.vault,
-        corpus=args.corpus, ledger_dir=args.ledger_dir, privacy_mode=args.privacy)
-
-    if args.check:
-        report = verify_install(config)
-        if args.json:
-            out.write(json.dumps(report, indent=2, sort_keys=True) + "\n")
-        else:
-            out.write(render_check(report))
-        return 0 if report["machinery_ok"] else 1
-
-    surfaces = detect_surfaces(config)
-    verify_cmd = f"muninn init --check --ledger-dir {config.ledger_dir}"
-
-    if args.dry_run:
-        manifest = {
-            "hooks_dir": str(pathlib.Path(config.ledger_dir) / "hooks"),
-            "hook_wrapper": str(pathlib.Path(config.ledger_dir) / "hooks"
-                               / "muninn_capture.sh"),
-            "settings_fragment": str(pathlib.Path(config.ledger_dir) / "hooks"
-                                    / "claude_settings.hooks.json"),
-            "env_file": str(pathlib.Path(config.ledger_dir) / "muninn.env"),
-            "install_readme": str(pathlib.Path(config.ledger_dir) / "hooks"
-                                 / "INSTALL.md"),
-        }
-    else:
-        manifest = generate_hook_config(config)
-
-    if args.json:
-        out.write(json.dumps({"config": config.to_dict(), "surfaces": surfaces,
-                              "manifest": manifest, "verify_cmd": verify_cmd,
-                              "dry_run": args.dry_run}, indent=2, sort_keys=True)
-                  + "\n")
-    else:
-        out.write(render_summary(config, surfaces, manifest, verify_cmd))
-        if args.dry_run:
-            out.write("  (dry run: no files were written)\n")
-        if not config.supported:
-            out.write(f"  NOTE: '{config.assistant}' surfaces are detected and "
-                      "configured, but live capture is not yet wired for it. The "
-                      "hook config is generated for when support lands; no CDRs "
-                      "will accrue from it today.\n")
-    return 0
+    return run_onboard(invite=args.invite, server_url=args.server_url,
+                       repo_override=args.repo, branch=args.branch,
+                       no_pr=args.no_pr, stdout=stdout)
 
 
 if __name__ == "__main__":
