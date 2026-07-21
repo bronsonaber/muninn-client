@@ -113,6 +113,7 @@ import hashlib
 import hmac
 import math
 import pathlib
+import re
 import unicodedata
 from typing import Any, Dict, List, Optional, Sequence, Set
 
@@ -156,6 +157,154 @@ EDGE_DUPLICATE_ID = "duplicate_id"                    # computed this phase
 EDGE_KINDS: frozenset = frozenset({
     EDGE_SUPERSEDES_CANDIDATE, EDGE_CONTRADICTS_CANDIDATE, EDGE_DUPLICATE_ID,
 })
+
+# ── policy_collision: a context-surface directive vs. the repo's own lockfile ──
+#
+# THE marquee contradiction case: a context surface (CLAUDE.md / AGENTS.md)
+# tells the agent to use one package manager while the repo's OWN lockfile
+# says a different one is actually in use. Unlike every signal above, this
+# one is checked against a second, independent, already machine-readable
+# ground truth (which lockfile is actually on disk), not a shape-only
+# pattern match against a single string -- it is a provable structural
+# fact, not a guess, which is why muninn_server.scoring treats it as a real,
+# high-priority finding rather than folding it into the low-severity
+# structural-hygiene bucket duplicate_id/collision_case_fold occupy.
+#
+# STRUCTURALLY DIFFERENT SIGNAL SHAPE, on purpose: _new_signal()'s base
+# shape (pointer/type/detected/confidence_local) describes a fact about ONE
+# pointer. A policy_collision is a fact about the relationship between TWO
+# pointers (the directive-bearing surface and the lockfile that contradicts
+# it), so it carries `other_pointer` and a closed-vocabulary `reason`
+# instead of `confidence_local`. See _new_policy_collision_signal() below.
+#
+# DELIBERATELY SCOPED TO ONE CASE, SHIPPED WELL: only CLAUDE.md/AGENTS.md
+# (both *.md, so read_vault() above already reads their body -- no new
+# file-reading surface is introduced) are scanned, against the three
+# well-known JS/Node lockfiles at the SAME root. A directive living in a
+# non-.md rules file (.cursor/rules/*.mdc, .cursorrules) is not read by
+# read_vault today (the non-md context-surfaces loop below records only
+# size/pointer for those, never a body) and is out of scope for this phase.
+
+SIGNAL_POLICY_COLLISION = "policy_collision"
+
+PKG_MANAGER_NPM = "npm"
+PKG_MANAGER_PNPM = "pnpm"
+PKG_MANAGER_YARN = "yarn"
+
+# filename -> the package manager whose lockfile it is. Root-level only: the
+# collision this closes is a directive at the repo root versus that SAME
+# root's own install ground truth; a lockfile several directories away in an
+# unrelated subpackage is not this signal's concern.
+LOCKFILE_TO_PKG_MANAGER: Dict[str, str] = {
+    "package-lock.json": PKG_MANAGER_NPM,
+    "pnpm-lock.yaml": PKG_MANAGER_PNPM,
+    "yarn.lock": PKG_MANAGER_YARN,
+}
+
+POLICY_COLLISION_REASON_PKG_MANAGER_MISMATCH = "pkg_manager_mismatch"
+POLICY_COLLISION_REASONS: frozenset = frozenset({
+    POLICY_COLLISION_REASON_PKG_MANAGER_MISMATCH,
+})
+
+# A closed, 3-token vocabulary (npm/pnpm/yarn) only -- unlike
+# shadow/surface_audit.py's generic subject capture (any 2-40 char token),
+# this cannot false-positive on an unrelated word. That is exactly what a
+# content-free bundle signal needs: a FACT, not a guess.
+_PKG_MANAGER_TOKEN = r"(npm|pnpm|yarn)"
+# A directive's tool name is routinely wrapped in markdown emphasis/code
+# formatting ("use `pnpm`", "use **pnpm**") -- tolerate up to 3 leading
+# markers, same allowance shadow/surface_audit.py's own _MD_MARK makes.
+_MD_MARK = r"[*_`]{0,3}"
+_PKG_ASSERT_VERBS = (
+    r"(?:always\s+)?(?:use|uses|using|prefer|prefers|run|runs|"
+    r"install\s+with|choose|chooses|standardi[sz]e\s+on|default\s+to)"
+)
+_PKG_PROHIBIT_CUE = (
+    r"(?:never(?:\s+use|\s+run)?|do\s+not(?:\s+use|\s+run)?|"
+    r"don't(?:\s+use|\s+run)?|avoid|no\s+longer\s+use|stop\s+using|"
+    r"not\s+allowed\s+to\s+use)"
+)
+_PKG_ASSERT_RE = re.compile(
+    r"(?i)\b" + _PKG_ASSERT_VERBS + r"\s+" + _MD_MARK + _PKG_MANAGER_TOKEN + r"\b")
+_PKG_PROHIBIT_RE = re.compile(
+    r"(?i)\b" + _PKG_PROHIBIT_CUE + r"\s+" + _MD_MARK + _PKG_MANAGER_TOKEN + r"\b")
+# A bare "<manager> install" mention (e.g. "always npm install", "Run `pnpm
+# install`") reads as an instruction to run that command, independent of the
+# assert-verb list above.
+_PKG_INSTALL_SUFFIX_RE = re.compile(
+    r"(?i)\b" + _MD_MARK + _PKG_MANAGER_TOKEN + r"\s+install\b")
+
+
+def _pkg_clauses(text: str) -> List[str]:
+    """Split a surface body into short clauses on sentence/line/comma
+    boundaries, same split shadow/surface_audit.py's own _clauses() uses,
+    so a prohibition and an assertion for two DIFFERENT tokens in the same
+    sentence ("Never use npm, always use pnpm") are examined independently
+    rather than letting one contaminate the other's match."""
+    parts = re.split(r"[.\n;,]", text or "")
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _detect_pkg_manager_directive(text: str) -> Optional[str]:
+    """The single package manager a context-surface body directs the agent
+    toward, or None if no clause makes an unambiguous assertion.
+
+    Clause-scoped (see _pkg_clauses): a clause that PROHIBITS a manager
+    ("never use npm") is skipped outright, so a prohibition naming a
+    manager is never mistaken for a directive toward it, regardless of
+    where in the text it falls relative to the real assertion. The first
+    clause (reading order) that asserts a manager -- either via an assert
+    verb ("use pnpm") or a bare "<manager> install" mention -- wins;
+    deterministic, first-match order.
+
+    Heuristic, not semantic understanding, same honest limitation
+    shadow/surface_audit.py's own lexical detectors carry: a lexical
+    pattern match, not an LLM judgement of intent.
+    """
+    if not text:
+        return None
+    for clause in _pkg_clauses(text):
+        if _PKG_PROHIBIT_RE.search(clause):
+            continue
+        m = _PKG_ASSERT_RE.search(clause) or _PKG_INSTALL_SUFFIX_RE.search(clause)
+        if not m:
+            continue
+        tok = m.group(1).lower()
+        if tok in LOCKFILE_TO_PKG_MANAGER.values():
+            return tok
+    return None
+
+
+def _detect_present_lockfiles(vault_root: pathlib.Path) -> Dict[str, str]:
+    """Root-level lockfile presence: filename -> package manager, for the
+    three known JS/Node lockfiles. Never raises (a permission error or a
+    race against a deleted file reads as "not present", never fatal)."""
+    found: Dict[str, str] = {}
+    for name, manager in LOCKFILE_TO_PKG_MANAGER.items():
+        try:
+            if (vault_root / name).is_file():
+                found[name] = manager
+        except OSError:
+            continue
+    return found
+
+
+def _new_policy_collision_signal(pointer: str, other_pointer: str,
+                                 reason: str) -> Dict[str, Any]:
+    """One policy_collision signal: the directive-bearing surface's
+    pointer, the contradicting lockfile's pointer, and a closed-vocabulary
+    reason code. See the module-level note above SIGNAL_POLICY_COLLISION
+    for why this shape deliberately differs from _new_signal()'s. No
+    free-text field exists here either, on purpose."""
+    assert reason in POLICY_COLLISION_REASONS, \
+        f"unknown policy_collision reason: {reason!r}"
+    return {
+        "pointer": pointer,
+        "other_pointer": other_pointer,
+        "type": SIGNAL_POLICY_COLLISION,
+        "detected": True,
+        "reason": reason,
+    }
 
 CONFIDENCE_LEVELS: frozenset = frozenset({"high", "medium", "low"})
 
@@ -488,6 +637,28 @@ def assemble_bundle(
             rep = min(by_id[i], key=lambda x: _rel(x.file_path, vault_root))
             rep_ptr = _keyed_tok("path", _rel(rep.file_path, vault_root), pointer_key)
             signals.append(_new_signal(rep_ptr, SIGNAL_COLLISION_CASE_FOLD, "high"))
+
+    # ── policy_collision (CLAUDE.md/AGENTS.md package-manager directive vs.
+    # the repo's own lockfile; see the module-level note above
+    # SIGNAL_POLICY_COLLISION) ──
+    present_lockfiles = _detect_present_lockfiles(vault_root)
+    if present_lockfiles:
+        present_managers = set(present_lockfiles.values())
+        # Deterministic pick when more than one lockfile is present: the
+        # lexicographically-first filename names the "other side" of the
+        # collision evidence.
+        other_lockfile_name = sorted(present_lockfiles)[0]
+        for e in entries:
+            if pathlib.Path(e.file_path).name not in ("CLAUDE.md", "AGENTS.md"):
+                continue
+            directive = _detect_pkg_manager_directive(e.body)
+            if directive is None or directive in present_managers:
+                continue
+            rel = _rel(e.file_path, vault_root)
+            surface_ptr = _keyed_tok("path", rel, pointer_key)
+            lock_ptr = _keyed_tok("path", other_lockfile_name, pointer_key)
+            signals.append(_new_policy_collision_signal(
+                surface_ptr, lock_ptr, POLICY_COLLISION_REASON_PKG_MANAGER_MISMATCH))
 
     # ── non-md context surfaces (CLAUDE.md, .cursor/rules, .claude/settings*, Codex) ──
     scanned_paths = {e.file_path for e in entries if e.file_path}
