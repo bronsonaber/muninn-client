@@ -1,0 +1,130 @@
+name: 'Muninn Context Receipt'
+description: >-
+  Posts (or updates) a redacted, reviewer-readable Context Receipt comment on
+  AI-authored pull requests: a context audit of the repo's context surfaces
+  (CLAUDE.md, AGENTS.md, .cursor/rules, etc.), never a code-quality or
+  security approval. Runs entirely inside your own Actions runner; nothing
+  leaves your repo except the comment it posts to your own PR via your own
+  token.
+author: 'Muninn'
+branding:
+  icon: 'file-text'
+  color: 'gray-dark'
+
+inputs:
+  ai-authored-label:
+    description: >-
+      PR label (exact match, case-insensitive) that marks a PR as
+      AI-authored. Set to '' to disable this signal.
+    required: false
+    default: 'ai-authored'
+  ai-authored-author-glob:
+    description: >-
+      Comma-separated glob pattern(s) (fnmatch syntax) matched against the
+      PR author's login, e.g. "*-bot,claude[bot]". Empty (default) disables
+      this signal.
+    required: false
+    default: ''
+  ai-authored-trailer:
+    description: >-
+      A commit-message trailer/marker (substring match) on the PR's head
+      commit that marks it AI-authored, e.g. "Co-Authored-By: Claude".
+      Checked via a local `git log` on the checked-out PR head, no network
+      call. Empty (default) disables this signal.
+    required: false
+    default: ''
+  path:
+    description: >-
+      Path (relative to the repo root) Muninn scans for context surfaces.
+    required: false
+    default: '.'
+  github-token:
+    description: >-
+      Token used to read the PR's labels/author and to post/update the
+      receipt comment. Defaults to the workflow's own GITHUB_TOKEN.
+
+      MANDATED MINIMAL PERMISSIONS for the calling workflow: this token
+      needs, and must be scoped to, exactly
+        permissions:
+          pull-requests: write
+          contents: read
+      Do not grant broader permissions (e.g. `contents: write`,
+      `issues: write`, or a blanket `write-all`) to the job that runs this
+      action -- it only ever reads repo files locally and posts/edits one
+      PR comment via the issues-comments endpoint.
+    required: false
+    default: ${{ github.token }}
+  python-version:
+    description: 'Python version used to run Muninn (pure stdlib, no pip install needed).'
+    required: false
+    default: '3.12'
+  server-url:
+    description: >-
+      Origin of a Muninn scoring server (e.g.
+      "https://muninn-edge.bronson-aber.workers.dev"). REQUIRED: this
+      client only runs in SERVER MODE. It assembles and signs a redacted
+      bundle locally and hands scoring to the configured server; it has no
+      local scoring engine. If left empty, the action fails immediately
+      with a clear error instead of attempting anything else.
+    required: false
+    default: ''
+  server-pubkey:
+    description: >-
+      The scoring server's own ed25519 public key (PEM), pinned client-side
+      so a returned receipt can be verified before it is ever posted. Only
+      used in SERVER MODE (see server-url). Not secret: safe to store as a
+      plain repo variable or a committed value.
+    required: false
+    default: ''
+  client-key-id:
+    description: >-
+      This repo's own registered client key id, produced by `python3 -m
+      shadow.keygen` (see shadow/keygen.py) and paired with
+      client-private-key below. Only used in SERVER MODE. Not secret.
+    required: false
+    default: ''
+  client-private-key:
+    description: >-
+      This repo's own ed25519 CLIENT PRIVATE KEY (PEM), generated once by
+      `python3 -m shadow.keygen` and registered public-key-only with the
+      scoring server (see muninn-server/PROVISIONING.md). This value is
+      sensitive: pass it via `${{ secrets.MUNINN_CLIENT_PRIVATE_KEY_PEM }}`,
+      a repo (or org) secret you create yourself -- never commit it and
+      never pass it as a plain input literal. If this and client-key-id are
+      both left empty while server-url is set, the client falls back to a
+      fresh EPHEMERAL keypair for this run only, which is unregistered and
+      will be rejected by the server; a clear notice is logged so that
+      failure reads as understandable, not mysterious. A real deployment
+      always configures both.
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    # Pinned to a full commit SHA, not the floating @v5 tag: a tag can be
+    # moved by the upstream repo (accidentally or via a compromised
+    # maintainer account) to point at different, unreviewed code without
+    # this file changing. The comment names the release the SHA currently
+    # corresponds to for human readability only; the SHA is what is
+    # actually trusted. Verified against
+    # https://api.github.com/repos/actions/setup-python/git/refs/tags/v5 --
+    # re-verify the same way before bumping.
+    - name: Set up Python
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Run Muninn Context Receipt
+      shell: bash
+      run: python3 "${{ github.action_path }}/shadow/pr_action.py"
+      env:
+        MUNINN_GITHUB_TOKEN: ${{ inputs.github-token }}
+        MUNINN_AI_LABEL: ${{ inputs.ai-authored-label }}
+        MUNINN_AI_AUTHOR_GLOB: ${{ inputs.ai-authored-author-glob }}
+        MUNINN_AI_TRAILER: ${{ inputs.ai-authored-trailer }}
+        MUNINN_SCAN_PATH: ${{ inputs.path }}
+        MUNINN_SERVER_URL: ${{ inputs.server-url }}
+        MUNINN_SERVER_PUBKEY: ${{ inputs.server-pubkey }}
+        MUNINN_CLIENT_KEY_ID: ${{ inputs.client-key-id }}
+        MUNINN_CLIENT_PRIVATE_KEY_PEM: ${{ inputs.client-private-key }}
