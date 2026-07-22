@@ -87,7 +87,7 @@ inputs:
     description: >-
       This repo's own ed25519 CLIENT PRIVATE KEY (PEM), generated once by
       `python3 -m shadow.keygen` and registered public-key-only with the
-      scoring server (see muninn-server/PROVISIONING.md). This value is
+      scoring server (see PROVISIONING.md). This value is
       sensitive: pass it via a repo (or org) secret you create yourself, named MUNINN_CLIENT_PRIVATE_KEY_PEM,
       a repo (or org) secret you create yourself -- never commit it and
       never pass it as a plain input literal. If this and client-key-id are

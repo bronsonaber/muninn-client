@@ -57,8 +57,8 @@ DEFAULT_ONBOARD_BRANCH = "muninn-setup"
 # all. THE ONE PLACE to bump on a future muninn-client release: update
 # MUNINN_CLIENT_REF (and its version comment) here, nowhere else -- both
 # CLIENT_ACTION_REF and the generated workflow derive from it.
-MUNINN_CLIENT_REF = "386f2956925b0ea2cebfdfb3c3e8e041339df9ec"  # muninn-client v0.1 (2026-07-21)
-MUNINN_CLIENT_VERSION_LABEL = "v0.1"
+MUNINN_CLIENT_REF = "29d5e153e6cd9296fa5adcebd985f2a3ea15bf63"  # muninn-client v0.1.1 (receipt names finding + pin self-check fix)
+MUNINN_CLIENT_VERSION_LABEL = "v0.1.1"
 CLIENT_ACTION_REF = f"bronsonaber/muninn-client@{MUNINN_CLIENT_REF}"
 WORKFLOW_RELPATH = ".github/workflows/muninn.yml"
 PRIVATE_KEY_FILENAME = ".muninn_client_key.pem"  # local only; deleted before exit
@@ -298,7 +298,7 @@ def _render_workflow(server_url: str) -> str:
         "      # would let a compromised muninn-client `main` run changed,\n"
         "      # unreviewed code in that window. Bump only on a Muninn\n"
         "      # security bulletin / release advisory -- see\n"
-        "      # muninn-server/PROVISIONING.md.\n"
+        "      # PROVISIONING.md.\n"
         f"      - uses: {CLIENT_ACTION_REF}  # pinned: {MUNINN_CLIENT_VERSION_LABEL}\n"
         "        with:\n"
         f"          server-url: '{server_url}'\n"

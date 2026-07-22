@@ -93,8 +93,32 @@ NONCE_HEX_LEN = 32  # secrets.token_hex(16) -> 128 bits of randomness
 
 # Domain-separation label for deriving the bundle pointer-tokenizer key from
 # an ed25519 signing key's raw seed. A fixed, never-changing context string:
-# changing it would silently reassign every customer's pointer key.
+# changing it would silently reassign every customer's pointer key. This is
+# the V1 (bundle-v1) derivation: a single plain HMAC-SHA256 over the seed.
+# Kept UNCHANGED so bundles produced by already-deployed v0.1/v0.1.1 clients
+# still reproduce byte-identical pointers.
 _POINTER_KEY_CONTEXT = b"muninn-bundle-pointer-key-v1"
+
+# ── v2 crypto-core: in-band alg + HKDF key separation (bundle_version 2) ──────
+#
+# ALG_V2 is the in-band scheme identifier the v2 bundle carries (see
+# shadow.bundle): "<signature-alg>+<pointer-alg>". It is folded INTO the
+# signed bundle, so the signing scheme AND the pointer scheme are both on the
+# wire and tamper-evident, and either can be swapped later (PQC-readiness)
+# behind a new alg/bundle_version without a forced client redeploy: the server
+# dispatches validation/verification on the declared version.
+ALG_V2 = "ed25519+hmac-sha256"
+
+# HKDF-SHA256 (RFC 5869) domain separation for v2. THE ROOT SECRET IS THE
+# ed25519 PRIVATE SEED (private_bytes_raw(), 32 bytes) that already lives in
+# the customer's PEM -- the CI secret MUNINN_CLIENT_PRIVATE_KEY_PEM, set once
+# at enrollment and never transmitted (see generate_keypair). Nothing new is
+# generated, stored, or rotated separately. A fixed, NON-SECRET salt plus a
+# per-purpose info label give each derived key its own domain, so the
+# pointer-HMAC key and the signing domain never reuse the same key material.
+_HKDF_SALT = b"muninn/crypto-core/v2"
+_HKDF_INFO_SIGN = b"muninn/crypto-core/v2/ed25519-sign"
+_HKDF_INFO_POINTER = b"muninn/crypto-core/v2/pointer-hmac"
 
 
 @dataclass(frozen=True)
@@ -157,6 +181,69 @@ def derive_pointer_key(private_pem: bytes) -> bytes:
         raise ValueError("private_pem does not decode to an ed25519 private key")
     seed = private_key.private_bytes_raw()
     return hmac.new(seed, _POINTER_KEY_CONTEXT, hashlib.sha256).digest()
+
+
+def _hkdf_sha256(ikm: bytes, salt: bytes, info: bytes, length: int = 32) -> bytes:
+    """RFC 5869 HKDF (extract-then-expand) over SHA-256, stdlib hmac/hashlib
+    only -- no new primitive beyond what this module already uses. Extract
+    derives a pseudorandom key (PRK) from the input keying material under
+    ``salt``; expand stretches the PRK to ``length`` bytes bound to ``info``
+    (the per-purpose domain label). Two calls that differ ONLY in ``info``
+    produce cryptographically independent outputs -- that is the property v2
+    relies on to keep the pointer-HMAC key and the signing domain from ever
+    sharing key material."""
+    prk = hmac.new(salt, ikm, hashlib.sha256).digest()
+    okm = b""
+    block = b""
+    counter = 1
+    while len(okm) < length:
+        block = hmac.new(prk, block + info + bytes([counter]), hashlib.sha256).digest()
+        okm += block
+        counter += 1
+    return okm[:length]
+
+
+def _ed25519_seed(private_pem: bytes) -> bytes:
+    """The raw 32-byte ed25519 seed behind a PEM private key -- the v2 ROOT
+    SECRET all v2 keys are derived from. Raises ValueError if private_pem is
+    not a valid ed25519 private key."""
+    private_key = serialization.load_pem_private_key(private_pem, password=None)
+    if not isinstance(private_key, Ed25519PrivateKey):
+        raise ValueError("private_pem does not decode to an ed25519 private key")
+    return private_key.private_bytes_raw()
+
+
+def derive_bundle_keys_v2(private_pem: bytes) -> Dict[str, bytes]:
+    """Derive the v2 domain-separated key set from a customer's ed25519
+    private key (the ROOT SECRET -- see the _HKDF_SALT comment). Returns
+    {"sign": <32 bytes>, "pointer": <32 bytes>}: two INDEPENDENT HKDF-SHA256
+    outputs under distinct info labels (_HKDF_INFO_SIGN vs _HKDF_INFO_POINTER)
+    so the pointer-HMAC key and the signing domain never reuse the same key
+    material.
+
+    "pointer" is the key shadow.bundle tokenizes every v2 pointer under.
+    "sign" is the HKDF-derived signing-DOMAIN key: v2 still SIGNS the envelope
+    with the raw ed25519 private key (so the already-registered public key
+    keeps verifying unchanged -- back-compat is mandatory), and this label is
+    reserved so a future non-ed25519 alg -- the PQC swap the in-band ALG_V2
+    field exists to enable -- can adopt an HKDF-derived signing key without
+    ever colliding with the pointer domain. Raises ValueError if private_pem
+    is not a valid ed25519 private key."""
+    seed = _ed25519_seed(private_pem)
+    return {
+        "sign": _hkdf_sha256(seed, _HKDF_SALT, _HKDF_INFO_SIGN, 32),
+        "pointer": _hkdf_sha256(seed, _HKDF_SALT, _HKDF_INFO_POINTER, 32),
+    }
+
+
+def derive_pointer_key_v2(private_pem: bytes) -> bytes:
+    """The v2 per-customer bundle-pointer HMAC key: the "pointer" half of
+    derive_bundle_keys_v2 (HKDF-SHA256 of the ed25519 seed under the
+    pointer-domain info label). Replaces v1's single plain HMAC derivation
+    (derive_pointer_key) with a full extract-and-expand plus domain
+    separation. v1 is kept UNCHANGED so already-deployed clients still
+    reproduce identical pointers. Raises ValueError on a non-ed25519 PEM."""
+    return derive_bundle_keys_v2(private_pem)["pointer"]
 
 
 class CanonicalizationError(ValueError):

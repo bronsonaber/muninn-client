@@ -1,6 +1,6 @@
 """shadow/keygen.py: first-run key-provisioning CLI for Phase 6's SERVER
 MODE client credential (the design-partner manual loop, the decided
-default for this phase -- see muninn-server/PROVISIONING.md for the full
+default for this phase -- see PROVISIONING.md for the full
 flow this CLI is step 1 of).
 
 WHAT THIS DOES: generates a new ed25519 keypair locally (reusing
@@ -22,7 +22,7 @@ is never present in captured stdout, in addition to reading it via the
 Keypair this CLI's run() returns for a full round-trip.
 
 THE FLOW THIS CLI KICKS OFF (fully spelled out again in the printed
-instructions and in muninn-server/PROVISIONING.md):
+instructions and in PROVISIONING.md):
   1. Run this CLI once. It writes a private-key PEM file locally and prints
      the public key + key_id.
   2. Register the printed public key + key_id with Muninn. Today that is a

@@ -3,8 +3,9 @@
 This module holds the small set of pure-stdlib functions, dataclasses, and
 constants that BOTH the public GitHub Action client (shadow/pr_action.py,
 shadow/bundle.py, shadow/signing.py, shadow/receipt.py, shadow/keygen.py,
-shadow/server_client.py, shadow/gh_client.py, and the muninn-init path:
-shadow/init.py, shadow/capture.py, shadow/cdr.py, shadow/context_inventory.py)
+shadow/server_client.py, shadow/gh_client.py, and the muninn init/faucet path:
+shadow/init.py, shadow/faucet.py, shadow/capture.py, shadow/cdr.py,
+shadow/context_inventory.py)
 AND the private scoring engine (shadow/doctor.py, shadow/admission.py,
 shadow/truthrot.py, shadow/repair_plan.py) need. Every symbol here was MOVED
 (not copied) out of its original private home so there is exactly one source
@@ -18,7 +19,7 @@ scoring engine physically present, because shadow/pr_action.py, shadow/
 bundle.py, shadow/signing.py, and shadow/receipt.py each had a top-of-file
 `from shadow import doctor` (or admission / truthrot / dryrun / repair_plan)
 whose OWN top-of-file imports reach into engine/core/*. A public client repo
-that ships shadow/ WITHOUT engine/, muninn-server/, doctor.py, admission.py,
+that ships shadow/ WITHOUT engine/, the server component, doctor.py, admission.py,
 truthrot.py, supersession.py, surface_audit.py, repair_plan.py, and dryrun.py
 now imports cleanly: every client module imports only from this module, the
 stdlib, and `cryptography` (shadow/signing.py, shadow/server_client.py only).

@@ -130,8 +130,37 @@ from shadow.pr_action import (           # noqa: E402
     DEFAULT_AI_AUTHOR_GLOB, DEFAULT_AI_LABEL, DEFAULT_AI_TRAILER,
     detect_ai_authored,
 )
+from shadow.signing import ALG_V2         # noqa: E402 -- in-band v2 scheme id
 
 SCHEMA_VERSION = "bundle-v0"
+
+# ── Bundle format version (declared in-band; see shadow.signing.ALG_V2) ──────
+# schema_version above names the CLOSED-ENUM shape family ("bundle-v0"); this
+# integer names the CRYPTO format (pointer width + key-derivation scheme).
+# v1: 64-bit pointers, v1 key derivation, NO bundle_version/alg fields on the
+#     wire (this is what already-deployed v0.1/v0.1.1 clients emit -- the
+#     server infers v1 from the ABSENCE of these two fields).
+# v2: 128-bit pointers, HKDF-separated keys, bundle carries bundle_version=2
+#     and alg=ALG_V2. New clients emit v2.
+# Both are accepted by the server, dispatched on the declared version.
+BUNDLE_VERSION_V1 = 1
+BUNDLE_VERSION_V2 = 2
+DEFAULT_BUNDLE_VERSION = BUNDLE_VERSION_V2
+
+# ── scan_type: which surface a bundle was assembled over (OPTIONAL, content-free) ──
+# A closed-enum marker naming WHAT this bundle scanned, so a downstream
+# consumer (the dashboard) can separate a retroactive baseline scan from a
+# per-PR scan. It is OPTIONAL and ABSENT by default: assemble_bundle() only
+# writes the key when a caller passes scan_type explicitly. The PR path
+# (shadow/pr_action.py) never passes it, so a PR bundle's wire bytes are
+# byte-for-byte unchanged -- the same "reserve-now, fill-later, no forced
+# migration" discipline bundle_version/alg already use. The server accepts a
+# bundle with OR without it; when present it must be one of these two codes
+# (schema.ts SCAN_TYPES), never free text. It carries no path, id, or content
+# -- just which of two fixed scan kinds produced the bundle.
+SCAN_TYPE_BASELINE = "baseline"   # retroactive scan over a repo's CURRENT surfaces
+SCAN_TYPE_PR = "pr"               # a per-PR scan (the historical/default meaning of an absent field)
+SCAN_TYPES: frozenset = frozenset({SCAN_TYPE_BASELINE, SCAN_TYPE_PR})
 
 # ── Closed enums (reserve-now-fill-later, matches shadow/cdr.py's pattern) ──
 
@@ -356,24 +385,33 @@ def _coded_ai_authored_reason(pr: Dict[str, Any], commit_message: str, *,
 
 # ── Bundle pointer tokenizer (keyed, bundle-only; see module docstring) ─────────
 
-POINTER_HMAC_HEX_LEN = 16  # 64 bits (widened from shadow/redact.py's 32-bit sha256[:8])
+POINTER_HMAC_HEX_LEN_V1 = 16  # 64 bits (bundle_version 1 / deployed v0.1 clients)
+POINTER_HMAC_HEX_LEN_V2 = 32  # 128 bits (bundle_version 2 -- collision resistance)
+# Default width every NEW bundle uses (assemble_bundle defaults to v2). Kept as
+# a name so the tests that assert pointer width against the default keep
+# tracking the default rather than a frozen literal.
+POINTER_HMAC_HEX_LEN = POINTER_HMAC_HEX_LEN_V2
 
 
-def _keyed_tok(prefix: str, s: str, pointer_key: bytes) -> str:
+def _keyed_tok(prefix: str, s: str, pointer_key: bytes,
+               hex_len: int = POINTER_HMAC_HEX_LEN_V2) -> str:
     """The bundle's own pointer tokenizer: HMAC-SHA256 keyed under
-    ``pointer_key`` (see shadow.signing.derive_pointer_key), truncated to
-    POINTER_HMAC_HEX_LEN hex chars (64 bits, up from shadow/redact.py's
-    unsalted 32-bit sha256[:8]). Deterministic WITHIN one key -- the same
-    input always maps to the same token for a given customer, so
-    duplicate_id / collision_case_fold detection across a customer's own
-    bundles still works -- but unguessable and non-correlatable to anyone
-    without that customer's key: unlike an unsalted hash, neither a
-    preimage-recovery brute force nor a confirm-by-guess check against a
-    suspected path/id succeeds without the key. shadow/redact.py's own
-    _tok() is untouched; this is a separate primitive for the bundle only,
-    not a change to that shared function's other callers."""
+    ``pointer_key`` (see shadow.signing.derive_pointer_key_v2), truncated to
+    ``hex_len`` hex chars. ``hex_len`` is POINTER_HMAC_HEX_LEN_V2 (32 hex =
+    128 bits) for a v2 bundle and POINTER_HMAC_HEX_LEN_V1 (16 hex = 64 bits)
+    for a v1 bundle -- the widening to 128 bits is for collision resistance;
+    the server accepts both widths, dispatched on the bundle's declared
+    version. Deterministic WITHIN one key -- the same input always maps to the
+    same token for a given customer, so duplicate_id / collision_case_fold
+    detection across a customer's own bundles still works -- but unguessable
+    and non-correlatable to anyone without that customer's key: unlike an
+    unsalted hash, neither a preimage-recovery brute force nor a
+    confirm-by-guess check against a suspected path/id succeeds without the
+    key. shadow/redact.py's own _tok() is untouched; this is a separate
+    primitive for the bundle only, not a change to that shared function's
+    other callers."""
     mac = hmac.new(pointer_key, s.encode("utf-8", "surrogatepass"), hashlib.sha256)
-    return f"{prefix}#{mac.hexdigest()[:POINTER_HMAC_HEX_LEN]}"
+    return f"{prefix}#{mac.hexdigest()[:hex_len]}"
 
 
 # The bundle's own raw-content tripwire. Ported from shadow/cdr.py's
@@ -499,6 +537,8 @@ def assemble_bundle(
     vault_dir: pathlib.Path,
     *,
     pointer_key: bytes,
+    bundle_version: int = DEFAULT_BUNDLE_VERSION,
+    scan_type: Optional[str] = None,
     now: Optional[str] = None,
     pr: Optional[Dict[str, Any]] = None,
     commit_message: str = "",
@@ -534,6 +574,18 @@ def assemble_bundle(
     attached a raw-content key, or a secret-/injection-shaped value, raises
     ForbiddenBundleKeyError instead of returning silently.
     """
+    if bundle_version not in (BUNDLE_VERSION_V1, BUNDLE_VERSION_V2):
+        raise ValueError(f"unsupported bundle_version: {bundle_version!r}")
+    if scan_type is not None and scan_type not in SCAN_TYPES:
+        raise ValueError(f"unsupported scan_type: {scan_type!r}")
+    hex_len = (POINTER_HMAC_HEX_LEN_V1 if bundle_version == BUNDLE_VERSION_V1
+               else POINTER_HMAC_HEX_LEN_V2)
+
+    def tok(prefix: str, s: str) -> str:
+        """Version-aware pointer tokenizer bound to this assembly's key +
+        width (see _keyed_tok)."""
+        return _keyed_tok(prefix, s, pointer_key, hex_len)
+
     vault_dir = pathlib.Path(vault_dir)
     try:
         vault_root = vault_dir.resolve()
@@ -561,8 +613,8 @@ def assemble_bundle(
     local_roots = _local_roots(vault_dir, [])
     for e in entries:
         rel = _rel(e.file_path, vault_root)
-        path_ptr = _keyed_tok("path", rel, pointer_key)
-        mem_ptr = _keyed_tok("mem", e.memory_id, pointer_key)
+        path_ptr = tok("path", rel)
+        mem_ptr = tok("mem", e.memory_id)
         try:
             size_bytes = pathlib.Path(e.file_path).stat().st_size
         except OSError:
@@ -610,7 +662,7 @@ def assemble_bundle(
         if len(group) < 2:
             continue
         ordered = sorted(group, key=lambda x: _rel(x.file_path, vault_root))
-        ptrs = [_keyed_tok("path", _rel(g.file_path, vault_root), pointer_key)
+        ptrs = [tok("path", _rel(g.file_path, vault_root))
                for g in ordered]
         hub, spokes = ptrs[0], ptrs[1:]
         for spoke in spokes:
@@ -630,12 +682,12 @@ def assemble_bundle(
             continue
         sorted_ids = sorted(ids)
         collision_pairs.append({
-            "fold_key_pointer": _keyed_tok("foldkey", key, pointer_key),
-            "fingerprints": [_keyed_tok("mem", i, pointer_key) for i in sorted_ids],
+            "fold_key_pointer": tok("foldkey", key),
+            "fingerprints": [tok("mem", i) for i in sorted_ids],
         })
         for i in sorted_ids:
             rep = min(by_id[i], key=lambda x: _rel(x.file_path, vault_root))
-            rep_ptr = _keyed_tok("path", _rel(rep.file_path, vault_root), pointer_key)
+            rep_ptr = tok("path", _rel(rep.file_path, vault_root))
             signals.append(_new_signal(rep_ptr, SIGNAL_COLLISION_CASE_FOLD, "high"))
 
     # ── policy_collision (CLAUDE.md/AGENTS.md package-manager directive vs.
@@ -655,8 +707,8 @@ def assemble_bundle(
             if directive is None or directive in present_managers:
                 continue
             rel = _rel(e.file_path, vault_root)
-            surface_ptr = _keyed_tok("path", rel, pointer_key)
-            lock_ptr = _keyed_tok("path", other_lockfile_name, pointer_key)
+            surface_ptr = tok("path", rel)
+            lock_ptr = tok("path", other_lockfile_name)
             signals.append(_new_policy_collision_signal(
                 surface_ptr, lock_ptr, POLICY_COLLISION_REASON_PKG_MANAGER_MISMATCH))
 
@@ -665,7 +717,7 @@ def assemble_bundle(
     for s in context_inventory.detect_surfaces(vault_root, scanned_paths):
         if s.classification == context_inventory.UNKNOWN:
             continue  # server-side / non-local: no path to fingerprint
-        path_ptr = _keyed_tok("path", s.pointer, pointer_key)
+        path_ptr = tok("path", s.pointer)
         try:
             size_bytes = (vault_root / s.pointer).stat().st_size
         except OSError:
@@ -699,7 +751,7 @@ def assemble_bundle(
     bundle: Dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "generated_now": now,
-        "vault_pointer": _keyed_tok("vault", str(vault_root), pointer_key),
+        "vault_pointer": tok("vault", str(vault_root)),
         "files": files,
         "influence_edges": influence_edges,
         "signals": signals,
@@ -716,6 +768,24 @@ def assemble_bundle(
             "total_est_tokens": total_tokens,
         },
     }
+
+    # v2 declares its crypto format IN-BAND, folded into the signed bundle:
+    # bundle_version=2 (128-bit pointers + HKDF-separated keys) and the scheme
+    # identifier alg=ALG_V2 ("ed25519+hmac-sha256"). A v1 bundle carries
+    # NEITHER field -- the server infers v1 from their absence -- so the wire
+    # shape deployed clients already produce is byte-for-byte unchanged.
+    if bundle_version == BUNDLE_VERSION_V2:
+        bundle["bundle_version"] = BUNDLE_VERSION_V2
+        bundle["alg"] = ALG_V2
+
+    # scan_type is OPTIONAL and only written when a caller passes it (see the
+    # SCAN_TYPE_* note above): the PR path never does, so a PR bundle's wire
+    # bytes stay byte-for-byte unchanged; a baseline scan sets "baseline".
+    # Folded into the signed bundle like bundle_version/alg -- the server's
+    # normalizeEnvelope carries it through so the backend re-verifies over the
+    # exact signed bytes -- and validated against a closed enum server-side.
+    if scan_type is not None:
+        bundle["scan_type"] = scan_type
 
     # THE invariant: an unredacted bundle must be structurally impossible to
     # return. This call is not a test -- it runs on every real assembly.

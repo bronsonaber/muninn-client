@@ -1,9 +1,9 @@
 """shadow/server_client.py: the client-side transport half of Phase 5
 (wiring the hardened client to the Phase 4 zero-trust server).
 
-Phase 4 (muninn-server/) stood up a server that never sees raw content and
+Phase 4 (the server component) stood up a server that never sees raw content and
 never returns anything but a fixed-shape, EDGE-SIGNED receipt (see
-muninn-server/worker/src/index.ts and receipt.ts). THIS module is the one
+the edge Worker's request handler and receipt module). THIS module is the one
 place in shadow/ that talks to that server over the network: it POSTs an
 already-signed envelope (shadow.signing.sign_bundle's output, built over
 shadow.bundle.assemble_bundle's output) to the Worker's `/submit` endpoint,
@@ -13,7 +13,7 @@ response before checking its signature.
 
 THE SERVER, PRECISELY: `server_url` here is the edge Worker's origin (e.g.
 "https://edge.muninn.example" locally "http://127.0.0.1:8787"), NOT the
-Python scoring backend's own origin -- that backend (muninn-server/backend/)
+Python scoring backend's own origin -- that backend (its own tree)
 is an internal implementation detail the Worker calls into over its own
 BACKEND_ORIGIN var; a client never talks to it directly. This module POSTs
 the envelope UNWRAPPED (just {"bundle": ..., "signature": ...}, no
@@ -26,14 +26,14 @@ on every request).
 TWO DIFFERENT SIGNATURES, TWO DIFFERENT KEYS -- do not confuse them:
   1. shadow.signing.sign_bundle()/verify_envelope() -- the CUSTOMER's own
      ed25519 key, over the bundle+envelope. Verified SERVER-side (by the
-     Python backend, see muninn-server/backend/muninn_server/app.py) before
+     Python backend, see its app module) before
      any scoring runs. This module does not touch that signature at all --
      it only ever produces (via shadow.signing, called by shadow.pr_action)
      an already-signed envelope to send.
   2. THIS module's own verify_receipt() -- the EDGE WORKER's own ed25519
      key (env.RECEIPT_SIGNING_KEY_JWK, a Worker Secret, never the
      customer's key), over the receipt the Worker composed
-     (muninn-server/worker/src/receipt.ts's canonicalReceiptBytes shape:
+     (the edge Worker's receipt module's canonicalReceiptBytes shape:
      {schema_version, request_id, key_id, verdict, scores, ts}). Verified
      CLIENT-side, here, before shadow.pr_action ever renders or posts
      anything. This is the signature a caller pins MUNINN_SERVER_PUBKEY
@@ -76,13 +76,13 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 log = logging.getLogger("muninn.server_client")
 
-# The Worker's own /submit path (muninn-server/worker/src/index.ts). A
+# The Worker's own /submit path (the edge Worker's request handler). A
 # caller passes the SERVER'S ORIGIN (e.g. "http://127.0.0.1:8787"); this
 # module appends this fixed path, the same way the Worker itself appends
 # "/score" to its own configured BACKEND_ORIGIN.
 SUBMIT_PATH = "/submit"
 
-# Must match muninn-server/worker/src/receipt.ts's RECEIPT_SCHEMA_VERSION
+# Must match the edge Worker's receipt module's RECEIPT_SCHEMA_VERSION
 # constant exactly -- this is a version check, not a magic string chosen
 # independently on this side of the wire.
 RECEIPT_SCHEMA_VERSION = "receipt-v1"
@@ -97,7 +97,7 @@ DEFAULT_TIMEOUT_SECONDS = 10.0
 # rejection. A distinct, identifiable UA avoids tripping that edge rule.
 USER_AGENT = "muninn-action/1.0"
 
-# Every field muninn-server/worker/src/receipt.ts's SignedReceipt interface
+# Every field the edge Worker's receipt module's SignedReceipt interface
 # guarantees on a 200 response. A response missing even one of these is not
 # receipt-shaped at all (see module docstring: that is a NoReceipt, not a
 # ServerSignatureError -- there is no signature to have failed).
@@ -131,7 +131,7 @@ SubmitResult = Union[Dict[str, Any], NoReceipt]
 
 
 def _canonical_receipt_bytes(fields: Dict[str, Any]) -> bytes:
-    """The exact byte shape muninn-server/worker/src/receipt.ts's own
+    """The exact byte shape the edge Worker's receipt module's own
     canonicalReceiptBytes()/sortKeysDeep() sign: the object
     {schema_version, request_id, key_id, verdict, scores, ts} (deliberately
     NOT including `sig` itself), JSON-encoded with keys sorted at every
@@ -161,6 +161,22 @@ def _canonical_receipt_bytes(fields: Dict[str, Any]) -> bytes:
         "scores": fields["scores"],
         "ts": fields["ts"],
     }
+    # GitHub App identity binding (the edge Worker's receipt module,
+    # canonicalReceiptBytes): the Worker includes `installation` in the signed
+    # bytes ONLY when the submitting key is bound to a verified installation; a
+    # legacy self-asserted-key receipt omits the key ENTIRELY (not null), so its
+    # canonical bytes stay identical to a pre-installation receipt. We must
+    # mirror that conditional inclusion exactly, using the same sub-object field
+    # names (installation_id, account_login), or every bound-key receipt fails
+    # verification here while every unbound one keeps working. sort_keys=True
+    # sorts these nested keys the same way sortKeysDeep does on the Worker side,
+    # so no manual ordering is needed.
+    installation = fields.get("installation")
+    if isinstance(installation, dict):
+        obj["installation"] = {
+            "installation_id": installation["installation_id"],
+            "account_login": installation["account_login"],
+        }
     return json.dumps(
         obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"),
     ).encode("utf-8")

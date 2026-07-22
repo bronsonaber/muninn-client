@@ -1,17 +1,19 @@
 """shadow/pr_action.py: orchestrates the Muninn Context Receipt GitHub
 Action end to end for one `pull_request` event.
 
-THIS IS THE PUBLIC, SERVER-MODE-ONLY CLIENT. It contains no scoring engine
-and cannot score anything locally. It only assembles a REDACTED, SIGNED
-fingerprint bundle from the repo and hands scoring to a configured server
-(MUNINN_SERVER_URL). If MUNINN_SERVER_URL is not configured, run() exits
-with an error instead of attempting to score anything in this job.
-
-    0. check_pinned_ref()     supply-chain self-check, runs FIRST, before
-                              anything else in run(): is THIS invocation
-                              pinned to an immutable commit SHA (see
-                              GITHUB_ACTION_REF), not a mutable `@main`/tag?
-                              Fails the job on an unpinned ref unless
+    0. resolve_action_ref() / supply-chain self-check, runs FIRST, before
+       check_pinned_ref()     anything else in run(): is THIS invocation
+                              pinned to an immutable commit SHA, not a
+                              mutable `@main`/tag? resolve_action_ref()
+                              works out the ref robustly (the composite
+                              action threads `github.action_ref` in as
+                              MUNINN_ACTION_REF via action.yml's step env,
+                              because the runner leaves GITHUB_ACTION_REF
+                              empty for a composite's inner steps -- see
+                              actions/runner#2473 -- with GITHUB_ACTION_REF
+                              then a SHA parsed from GITHUB_ACTION_PATH as
+                              fallbacks); check_pinned_ref() then fails the
+                              job on an unpinned ref unless
                               MUNINN_ALLOW_UNPINNED=true is set. This job
                               runs with the customer's raw files and repo
                               secrets BEFORE Muninn's own redaction step
@@ -21,30 +23,35 @@ with an error instead of attempting to score anything in this job.
     1. detect_ai_authored()   pure decision function: is this PR AI-authored,
                               per a CONFIGURABLE signal (a label, an author
                               glob, or a commit-trailer marker)? No I/O.
-    2. build_server_receipt() assemble + sign a redacted fingerprint bundle
-                              (shadow.bundle / shadow.signing) over the
-                              repo's context surfaces and hand scoring to
-                              the configured server (shadow.server_client);
-                              it renders only what a VERIFIED server-signed
-                              receipt returned, never scores anything
-                              in-process.
+    2. build_server_receipt() score the repo's context surfaces at the PR
+                              head and render the Markdown receipt. This
+                              public client is SERVER MODE ONLY: assemble +
+                              sign a redacted fingerprint bundle
+                              (shadow.bundle / shadow.signing) and hand
+                              scoring to a configured server
+                              (shadow.server_client); it renders only what a
+                              VERIFIED server-signed receipt returned, never
+                              scoring in this job.
     3. shadow.gh_client       the ONE module that talks to GitHub. main()
                               below is the only caller that constructs a
                               real GitHubClient; every other function here
                               takes a client as a parameter so a test can
                               hand it a fake and assert zero network calls.
 
-A non-AI-authored PR returns before build_server_receipt() or the GitHub
-client is even touched -- no comment, no API call, matching the Action's
-design goal that nothing about a human-authored PR's review changes.
+A non-AI-authored PR returns before the build_server_receipt() function or the
+GitHub client is even touched -- no comment, no API call, matching the
+Action's design goal that nothing about a human-authored PR's review
+changes.
 
-SERVER MODE ONLY: run() requires MUNINN_SERVER_URL. The client generates or
-loads its own signing keypair (shadow.signing), assembles + signs a bundle
-(shadow.bundle, shadow.signing), and calls shadow.server_client, which
-verifies the server's own signature on the returned receipt before handing
-it back. Two distinct failure postures, both required by the wedge running
-unattended in a customer's CI (see shadow.server_client's module docstring
-for the full reasoning):
+SERVER MODE (Phase 5): run() requires MUNINN_SERVER_URL to be configured.
+This public client is SERVER MODE ONLY and has no local scoring path. SERVER
+MODE offloads scoring to the configured server: the client generates
+or loads its own signing keypair (shadow.signing), assembles + signs a
+bundle (shadow.bundle, shadow.signing), and calls shadow.server_client,
+which verifies the server's own signature on the returned receipt before
+handing it back. Two distinct failure postures, both required by the wedge
+running unattended in a customer's CI (see shadow.server_client's module
+docstring for the full reasoning):
   - server unreachable/timeout/non-2xx/malformed response (shadow.
     server_client.NoReceipt): log it, post no comment, return 0 -- the
     customer's CI job must never fail because the scoring server had a bad
@@ -82,10 +89,10 @@ from shadow.gh_client import GitHubClient, upsert_comment  # noqa: E402
 # imported lazily inside build_server_receipt() instead, the only function
 # that needs it.
 #
-# This public client never imports a scoring engine at all, at module level
-# or otherwise: it has no local scoring mode. `import shadow.pr_action`
-# always succeeds with only the files that ship in this repo present -- see
-# the module docstring.
+# This public client is SERVER MODE ONLY: it ships shadow/ WITHOUT any
+# scoring modules physically present, yet must still be able to
+# `import shadow.pr_action` and run SERVER MODE (build_server_receipt())
+# end to end -- see tests/test_client_severance.py.
 
 # Defaults for the three CONFIGURABLE AI-authorship signals. Any of the
 # three may be turned off by passing an empty string; label detection is on
@@ -192,8 +199,8 @@ def check_pinned_ref(action_ref: str, *, allow_unpinned: bool
         "this repo's raw files and secrets BEFORE Muninn's redaction step "
         "ever runs. Pin this input to a commit SHA instead, e.g. "
         "'uses: bronsonaber/muninn-client@<40-char-sha>  # pinned: vX.Y' -- "
-        "see PROVISIONING.md for the current recommended SHA and our "
-        "security-bulletin/version-rotation policy.")
+        "see PROVISIONING.md for the current recommended SHA "
+        "and our security-bulletin/version-rotation policy.")
     if allow_unpinned:
         lines.append(
             "muninn-context-receipt: MUNINN_ALLOW_UNPINNED=true is set; "
@@ -267,10 +274,10 @@ def build_server_receipt(
     client_key_id: str = "", client_private_key_pem: bytes = b"",
     now: Optional[str] = None,
 ) -> Optional[str]:
-    """SERVER MODE's build step: assemble + sign a redacted fingerprint
-    bundle over `vault`, then hand scoring to the configured server
-    (shadow.server_client). This client never scores anything itself.
-    Local reads only to ASSEMBLE the bundle; the one network call is
+    """SERVER MODE's build step (Phase 5): assemble + sign a redacted
+    fingerprint bundle over `vault`, then hand scoring to the configured
+    server (shadow.server_client) rather than scoring in this
+    job. Local reads only to ASSEMBLE the bundle; the one network call is
     inside shadow.server_client.submit_envelope().
 
     Returns the rendered receipt Markdown on success, or None if no receipt
@@ -301,7 +308,10 @@ def build_server_receipt(
         kp = signing.generate_keypair()
         key_id, private_pem = kp.key_id, kp.private_pem
 
-    pointer_key = signing.derive_pointer_key(private_pem)
+    # v2 crypto-core: HKDF-separated pointer key + a v2 (128-bit pointer)
+    # bundle. assemble_bundle defaults to bundle_version=2, so new clients
+    # emit v2; the server still accepts v1 from already-deployed clients.
+    pointer_key = signing.derive_pointer_key_v2(private_pem)
     bundle = bundle_mod.assemble_bundle(
         vault, pointer_key=pointer_key, now=now, pr=pr,
         commit_message=commit_message, ai_label=ai_label,
@@ -338,29 +348,21 @@ def run(event: Dict[str, Any], *, workspace: str, repo: str, token: str,
     real GitHubClient (and therefore never touch urllib) -- a fake factory
     can hand back a recording stub and assert it was (or was not) called.
 
-    SERVER MODE ONLY: `server_url` is required. If it is empty, run() exits
-    immediately with a clear error rather than attempting any local
-    scoring -- this public client has no scoring engine to fall back to.
-    See the module docstring for the two failure postures server mode can
-    hit once a server is configured.
+    This public client is SERVER MODE ONLY: `server_url` (MUNINN_SERVER_URL)
+    is required and drives build_server_receipt(), whose one network call is
+    inside shadow.server_client; an empty `server_url` is a hard error. See
+    the module docstring for the two failure postures server mode can hit.
 
     The pinned-ref self-check (see check_pinned_ref()) runs FIRST, before
-    anything else -- including the server-url check and the non-AI-authored
-    early-return below -- so an unpinned `uses:` fails the job (or at least
-    warns) on every PR, not only the ones this Action would otherwise have
-    acted on."""
+    anything else -- including the non-AI-authored early-return below -- so
+    an unpinned `uses:` fails the job (or at least warns) on every PR, not
+    only the ones this Action would otherwise have acted on."""
     out = stdout or sys.stdout
     if ref_source:
         out.write(f"muninn-context-receipt: pinned-ref source: {ref_source}\n")
     ref_ok, ref_message = check_pinned_ref(action_ref, allow_unpinned=allow_unpinned)
     out.write(ref_message + "\n")
     if not ref_ok:
-        return 1
-
-    if not server_url:
-        out.write("muninn-context-receipt: ERROR: server-url is required; "
-                  "the public client only runs in server mode. Set "
-                  "MUNINN_SERVER_URL (see PROVISIONING.md).\n")
         return 1
 
     pr = event.get("pull_request")
@@ -385,34 +387,40 @@ def run(event: Dict[str, Any], *, workspace: str, repo: str, token: str,
                   "no comment posted.\n")
         return 0
 
-    out.write("muninn-context-receipt: server mode (MUNINN_SERVER_URL "
-              f"configured: {server_url}); scoring runs server-side.\n")
-    if not (client_key_id and client_private_key_pem):
-        out.write("muninn-context-receipt: NOTICE: MUNINN_CLIENT_KEY_ID / "
-                  "MUNINN_CLIENT_PRIVATE_KEY_PEM not configured; using a "
-                  "fresh EPHEMERAL, UNREGISTERED signing key for this run "
-                  "only -- the server will reject it until its public key "
-                  "is registered (run `python3 -m shadow.keygen` and see "
-                  "PROVISIONING.md), so expect 'no receipt available' "
-                  "below rather than a mystery failure.\n")
-    try:
-        body = build_server_receipt(
-            vault, pr=pr, commit_message=commit_message,
-            ai_label=label, ai_author_glob=author_glob, ai_trailer=trailer,
-            server_url=server_url,
-            server_public_key_pem=server_public_key_pem,
-            client_key_id=client_key_id,
-            client_private_key_pem=client_private_key_pem)
-    except server_client.ServerSignatureError as exc:
-        out.write(f"muninn-context-receipt: SECURITY EVENT: {exc}\n")
-        out.write("muninn-context-receipt: refusing to post any "
-                  "comment; failing this step.\n")
+    if server_url:
+        out.write("muninn-context-receipt: server mode (MUNINN_SERVER_URL "
+                  f"configured: {server_url}); scoring runs server-side.\n")
+        if not (client_key_id and client_private_key_pem):
+            out.write("muninn-context-receipt: NOTICE: MUNINN_CLIENT_KEY_ID / "
+                      "MUNINN_CLIENT_PRIVATE_KEY_PEM not configured; using a "
+                      "fresh EPHEMERAL, UNREGISTERED signing key for this run "
+                      "only -- the server will reject it until its public key "
+                      "is registered (run `python3 -m shadow.keygen` and see "
+                      "PROVISIONING.md), so expect 'no receipt "
+                      "available' below rather than a mystery failure.\n")
+        try:
+            body = build_server_receipt(
+                vault, pr=pr, commit_message=commit_message,
+                ai_label=label, ai_author_glob=author_glob, ai_trailer=trailer,
+                server_url=server_url,
+                server_public_key_pem=server_public_key_pem,
+                client_key_id=client_key_id,
+                client_private_key_pem=client_private_key_pem)
+        except server_client.ServerSignatureError as exc:
+            out.write(f"muninn-context-receipt: SECURITY EVENT: {exc}\n")
+            out.write("muninn-context-receipt: refusing to post any "
+                      "comment; failing this step.\n")
+            return 1
+        if body is None:
+            out.write("muninn-context-receipt: no receipt available this "
+                      "run (server unreachable, timed out, or rejected the "
+                      "request); no comment posted, exiting clean.\n")
+            return 0
+    else:
+        out.write("muninn-context-receipt: ERROR: MUNINN_SERVER_URL is "
+                  "required; this public client runs in SERVER MODE ONLY "
+                  "and has no local scoring engine (see PROVISIONING.md).\n")
         return 1
-    if body is None:
-        out.write("muninn-context-receipt: no receipt available this "
-                  "run (server unreachable, timed out, or rejected the "
-                  "request); no comment posted, exiting clean.\n")
-        return 0
 
     issue_number = pr.get("number")
     if not issue_number:
@@ -461,9 +469,10 @@ def main(argv: Optional[list] = None) -> int:
         label=os.environ.get("MUNINN_AI_LABEL", DEFAULT_AI_LABEL),
         author_glob=os.environ.get("MUNINN_AI_AUTHOR_GLOB", DEFAULT_AI_AUTHOR_GLOB),
         trailer=os.environ.get("MUNINN_AI_TRAILER", DEFAULT_AI_TRAILER),
-        # SERVER MODE ONLY: MUNINN_SERVER_URL is required. If unset/empty,
-        # run() exits with an error instead of attempting any local
-        # scoring -- see the module docstring and run()'s own docstring.
+        # Phase 5: MUNINN_SERVER_URL selects the configured scoring server
+        # in run() -- see the module docstring. This public client is SERVER
+        # MODE ONLY; all four are "" / b"" (falsy) by default until a caller
+        # explicitly configures a server.
         server_url=os.environ.get("MUNINN_SERVER_URL", ""),
         server_public_key_pem=os.environ.get(
             "MUNINN_SERVER_PUBKEY", "").encode("utf-8"),
