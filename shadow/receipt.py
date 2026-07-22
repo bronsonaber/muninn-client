@@ -248,62 +248,213 @@ def _decision_section_local(first_look: Dict[str, Any]) -> List[str]:
     return L
 
 
+# Human phrasing for each content-free high-risk finding TYPE the server's
+# scores-v1 may name per pointer (muninn_server.scoring's finding-type enum):
+# (noun for the decision line, why-it-matters clause). policy_collision is
+# handled separately below (it needs its paired-pointer evidence), so it is
+# not in this map. A type that is absent (an older server that predates the
+# `type` field), unknown (a newer type this client predates), or a MIX of
+# distinct recognized types all fall back to _GENERIC_HIGH_* -- the honest
+# secret-or-injection wording, never a false-specific claim, never a crash.
+_HIGH_TYPE_NOUN = {
+    "secret_shaped": "secret-shaped content",
+    "injection_shaped": "injection-shaped content",
+    "contradiction": "a contradiction between context surfaces",
+}
+_HIGH_TYPE_WHY = {
+    "secret_shaped": ("the diff passes CI but may carry a live secret the "
+                      "server could not rule out as safe"),
+    "injection_shaped": ("the diff passes CI but may carry an injection-"
+                         "shaped instruction the server could not rule out "
+                         "as safe"),
+    "contradiction": ("the diff passes CI but two context surfaces disagree "
+                      "in a way the server cannot resolve as safe"),
+}
+_GENERIC_HIGH_NOUN = "secret- or injection-shaped content"
+_GENERIC_HIGH_WHY = ("the diff passes CI but may carry a live secret or an "
+                     "injection-shaped instruction the server could not rule "
+                     "out as safe")
+
+
+def _decision_lead_policy_collision(
+        high: List[Dict[str, Any]], flagged: List[Dict[str, Any]],
+        policy_collisions: List[Dict[str, Any]]) -> List[str]:
+    """The decision-card lead for a run whose dominant finding is a package-
+    manager policy collision. Evidence prefers the paired pointers the
+    server's policy_collisions list carries (context surface + lockfile +
+    closed-vocabulary reason); if that list is absent but a high_risk pointer
+    is TYPED policy_collision (e.g. an older/partial server that dropped the
+    paired list), it still names the collision from the typed pointer alone
+    rather than falling back to the misleading secret/injection phrasing --
+    that mismatch is the exact live bug this receiver fixes."""
+    collision_files = [f for f in high
+                       if isinstance(f, dict) and f.get("type") == "policy_collision"]
+    have_pairs = bool(policy_collisions)
+    n = len(policy_collisions) if have_pairs else len(collision_files)
+    plural = "" if n == 1 else "s"
+    L = [_sentence(
+        "your context tells the agent to use one package manager "
+        "while the repo's lockfile implies another" +
+        (f" ({n} such collision{plural} this run)" if n > 1 else "")),
+        "",
+        "### Why it matters",
+        _sentence("the diff can pass CI and still install the wrong "
+                  "dependencies"),
+        "",
+        "### Evidence"]
+    cap = 15
+    if have_pairs:
+        for pc in policy_collisions[:cap]:
+            L.append(f"- context surface `{_safe(pc.get('pointer', ''))}` "
+                     f"conflicts with lockfile "
+                     f"`{_safe(pc.get('other_pointer', ''))}` "
+                     f"(reason: `{_safe(pc.get('reason', ''))}`)")
+        collision_pointers = {pc.get("pointer") for pc in policy_collisions
+                              if isinstance(pc, dict)}
+    else:
+        for f in collision_files[:cap]:
+            L.append(f"- context surface `{_safe(f.get('pointer', ''))}` "
+                     f"(lane hint: `{_safe(f.get('lane_hint', ''))}`); the "
+                     f"paired lockfile pointer was not carried in this "
+                     f"receipt")
+        collision_pointers = {f.get("pointer") for f in collision_files
+                              if isinstance(f, dict)}
+    if n > cap:
+        L.append(f"- ...and {n - cap} more")
+    # A collision surface's own file entry also scores risk == high_risk
+    # (muninn_server.scoring._risk_for), but that entry's high_risk status IS
+    # the collision just named above, not a SEPARATE finding -- excluded here
+    # so "additional ... for other reasons" never double-counts the same
+    # pointer under a misleading label.
+    other_high = [f for f in high
+                  if not (isinstance(f, dict) and f.get("pointer") in collision_pointers)]
+    other = len(other_high) + len(flagged)
+    if other:
+        L.append("")
+        L.append(_sentence(
+            f"{other} additional pointer{'s' if other != 1 else ''} "
+            f"flagged or high-risk for other reasons, listed below"))
+    return L
+
+
+def _decision_lead_high_risk(high: List[Dict[str, Any]],
+                             flagged: List[Dict[str, Any]],
+                             high_types: set) -> List[str]:
+    """The decision-card lead for a high_risk run that is NOT a policy
+    collision. Names the finding by its content-free TYPE when the server
+    supplied one (secret-shaped vs. injection-shaped, distinctly); falls back
+    to the honest generic secret-or-injection wording when the type is
+    absent (older server), unknown, or a mix of distinct types."""
+    recognized = {t for t in high_types if t in _HIGH_TYPE_NOUN}
+    if len(recognized) == 1:
+        only = next(iter(recognized))
+        noun = _HIGH_TYPE_NOUN[only]
+        why = _HIGH_TYPE_WHY[only]
+    else:
+        noun = _GENERIC_HIGH_NOUN
+        why = _GENERIC_HIGH_WHY
+
+    n = len(high)
+    singular = n == 1
+    plural = "" if singular else "s"
+    verb = "needs" if singular else "need"
+    scores_verb = "scores" if singular else "score"
+    L = [_sentence(f"{n} pointer{plural} in the submitted bundle "
+                   f"{scores_verb} high_risk for {noun} and {verb} a human "
+                   f"call before this merges"),
+         "",
+         "### Why it matters",
+         _sentence(why),
+         "",
+         "### Evidence"]
+    cap = 15
+    for f in high[:cap]:
+        L.append(f"- `{_safe(f.get('pointer', ''))}` "
+                 f"(lane hint: `{_safe(f.get('lane_hint', ''))}`)")
+    if n > cap:
+        L.append(f"- ...and {n - cap} more")
+    if flagged:
+        m = len(flagged)
+        L.append("")
+        L.append(f"{m} additional flagged pointer{'s' if m != 1 else ''} for "
+                 f"structural hygiene listed below.")
+    return L
+
+
+def _decision_lead_flagged(flagged: List[Dict[str, Any]]) -> List[str]:
+    """The decision-card lead for a run with only structural-hygiene flags
+    (no high_risk, no policy collision)."""
+    n = len(flagged)
+    singular = n == 1
+    plural = "" if singular else "s"
+    verb = "needs" if singular else "need"
+    what = ("was flagged for structural hygiene" if singular
+            else "were flagged for structural hygiene")
+    L = [_sentence(f"{n} pointer{plural} in the submitted bundle {what} "
+                   f"and {verb} a human call before this merges"),
+         "",
+         "### Why it matters",
+         _sentence("the diff passes CI but the flagged pointer(s) may signal "
+                   "structural drift the server cannot resolve as safe"),
+         "",
+         "### Evidence"]
+    cap = 15
+    for f in flagged[:cap]:
+        L.append(f"- `{_safe(f.get('pointer', ''))}` "
+                 f"(lane hint: `{_safe(f.get('lane_hint', ''))}`)")
+    if n > cap:
+        L.append(f"- ...and {n - cap} more")
+    return L
+
+
 def _decision_section_server(scores: Dict[str, Any]) -> List[str]:
     """The decision card's lead block for server-scored mode, same shape as
     _decision_section_local above but adapted to the server's scores-v1
-    fields (risk_counts / files, not a first_look lead list): high_risk
-    pointers take priority over flagged ones for naming the decision, and
-    every pointer at that risk level is listed as evidence, never just one."""
+    fields (risk_counts / files, not a first_look lead list). The card LEADS
+    with the dominant finding TYPE, named from the content-free `type`
+    category the server now carries per pointer.
+
+    policy_collision LEADS when present: it is a provable, deterministic
+    contradiction (a context surface's directive text vs. the repo's own
+    lockfile), the marquee case this decision card exists to prove server
+    mode catches -- see muninn_server.scoring._risk_for's own docstring for
+    why it is scored HIGH alongside secret/injection rather than folded into
+    the lower structural-hygiene tier. Its presence is detected from EITHER
+    the paired policy_collisions list OR a high_risk pointer typed
+    policy_collision, so a receipt names the collision even if the paired
+    list is missing. When no policy collision is present, high_risk pointers
+    take priority over flagged ones for naming the decision and are named by
+    their own finding type (secret-shaped vs. injection-shaped, distinctly),
+    falling back to the honest generic wording when the type is absent
+    (older server), unknown, or mixed. Every pointer at the leading risk
+    level is listed as evidence, never just one. A policy_collision finding
+    is never hidden even when it does not lead: the dedicated 'Policy
+    collisions' section below always renders it."""
     files = scores.get("files")
     files = files if isinstance(files, list) else []
     high = [f for f in files if isinstance(f, dict) and f.get("risk") == "high_risk"]
     flagged = [f for f in files if isinstance(f, dict) and f.get("risk") == "flagged"]
+    policy_collisions = scores.get("policy_collisions")
+    policy_collisions = policy_collisions if isinstance(policy_collisions, list) else []
 
     L = ["### Decision needed before merge"]
-    if not high and not flagged:
+    if not high and not flagged and not policy_collisions:
         L.append(f"No context risk found in the scanned surfaces "
                  f"({STATUS_NO_RISKS_FOUND}). Nothing here requires a merge "
                  f"decision; this is not an approval, only an absence of "
                  f"findings in what was submitted.")
         return L
 
-    rows = high if high else flagged
-    n = len(rows)
-    singular = n == 1
-    plural = "" if singular else "s"
-    if high:
-        what = ("scores high_risk for secret- or injection-shaped content"
-                if singular else
-                "score high_risk for secret- or injection-shaped content")
+    high_types = {f.get("type") for f in high
+                  if isinstance(f, dict) and isinstance(f.get("type"), str)}
+    has_policy_collision = bool(policy_collisions) or ("policy_collision" in high_types)
+
+    if has_policy_collision:
+        L.extend(_decision_lead_policy_collision(high, flagged, policy_collisions))
+    elif high:
+        L.extend(_decision_lead_high_risk(high, flagged, high_types))
     else:
-        what = ("was flagged for structural hygiene" if singular
-                else "were flagged for structural hygiene")
-    verb = "needs" if singular else "need"
-    L.append(_sentence(f"{n} pointer{plural} in the submitted bundle {what} "
-                       f"and {verb} a human call before this merges"))
-    L.append("")
-    L.append("### Why it matters")
-    if high:
-        why = ("the diff passes CI but may carry a live secret or an "
-              "injection-shaped instruction the server could not rule out "
-              "as safe")
-    else:
-        why = ("the diff passes CI but the flagged pointer(s) may signal "
-              "structural drift the server cannot resolve as safe")
-    L.append(_sentence(why))
-    L.append("")
-    L.append("### Evidence")
-    cap = 15
-    for f in rows[:cap]:
-        L.append(f"- `{_safe(f.get('pointer', ''))}` "
-                 f"(lane hint: `{_safe(f.get('lane_hint', ''))}`)")
-    if n > cap:
-        L.append(f"- ...and {n - cap} more")
-    if high and flagged:
-        m = len(flagged)
-        L.append("")
-        L.append(f"{m} additional flagged pointer{'s' if m != 1 else ''} for "
-                 f"structural hygiene listed below.")
+        L.extend(_decision_lead_flagged(flagged))
     return L
 
 
@@ -327,6 +478,10 @@ def _server_scored_section(scores: Dict[str, Any]) -> List[str]:
         L.append(f"- {dup} duplicate-id group(s) detected")
     if coll:
         L.append(f"- {coll} case-fold collision group(s) detected")
+    policy_collisions = scores.get("policy_collisions")
+    if isinstance(policy_collisions, list) and policy_collisions:
+        L.append(f"- {len(policy_collisions)} policy collision(s) detected "
+                 f"(context directive vs. lockfile)")
     rs = scores.get("resource_stats") or {}
     L.append(f"- resource footprint: {rs.get('total_size_bytes', 0)} bytes, "
              f"~{rs.get('total_est_tokens', 0)} est. tokens")
@@ -345,6 +500,26 @@ def _server_pointer_section(heading: str, files: List[Dict[str, Any]],
                  f"(lane hint: `{_safe(f.get('lane_hint', ''))}`)")
     if len(rows) > cap:
         L.append(f"- ...and {len(rows) - cap} more")
+    return L
+
+
+def _policy_collision_section(policy_collisions: List[Dict[str, Any]],
+                              cap: int = 15) -> List[str]:
+    """Always renders every policy_collision finding, whether or not it led
+    the decision card above (see _decision_section_server's own docstring
+    for when it does not lead) -- a finding is never dropped just because
+    it was not the one named first."""
+    L = ["### Policy collisions (package manager mismatch)"]
+    if not policy_collisions:
+        L.append("None this run.")
+        return L
+    for pc in policy_collisions[:cap]:
+        L.append(f"- context surface `{_safe(pc.get('pointer', ''))}` "
+                 f"conflicts with lockfile "
+                 f"`{_safe(pc.get('other_pointer', ''))}` "
+                 f"(reason: `{_safe(pc.get('reason', ''))}`)")
+    if len(policy_collisions) > cap:
+        L.append(f"- ...and {len(policy_collisions) - cap} more")
     return L
 
 
@@ -396,6 +571,10 @@ def render_server_receipt(receipt: Dict[str, Any]) -> str:
     L.extend(_server_pointer_section(
         "Flagged pointers (structural hygiene, not safety)", files, "flagged"))
     L.append("")
+    policy_collisions = scores.get("policy_collisions")
+    policy_collisions = policy_collisions if isinstance(policy_collisions, list) else []
+    L.extend(_policy_collision_section(policy_collisions))
+    L.append("")
     L.append("### What Muninn refused to conclude")
     L.append("- **risk = high_risk**: secret/injection-shaped signal matched "
              "by SHAPE only, on the redacted bundle the server received. "
@@ -403,6 +582,12 @@ def render_server_receipt(receipt: Dict[str, Any]) -> str:
              "from a quoted example, so it draws no conclusion either way "
              "and never proposes an automated fix. A human must verify the "
              "match in context before acting.")
+    L.append("- **policy_collision**: a structural fact (a directive "
+             "pattern matched in a context surface against which lockfile "
+             "is actually present), not a semantic read of intent. Muninn "
+             "does not conclude which package manager the project should "
+             "standardize on, only that the two disagree today; a human "
+             "must decide which side is correct.")
     L.append("- **lane hints** reflect Muninn's real admission engine run "
              "over only the signals a redacted bundle can honestly carry "
              "(no provenance data crosses the wire); a `reject` hint here "

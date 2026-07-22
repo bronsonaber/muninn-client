@@ -132,10 +132,24 @@ runs:
     # documented, not-recommended escape hatch; it still emits a
     # SECURITY WARNING even when it lets the run continue). See
     # PROVISIONING.md for the current recommended pinned SHA.
+    #
+    # MUNINN_ACTION_REF below is the load-bearing line: for the inner steps
+    # of a COMPOSITE action the runner leaves the GITHUB_ACTION_REF env var
+    # EMPTY even when the caller pinned `uses:` to a correct commit SHA
+    # (actions/runner#2473, #2525), which used to make the self-check reject
+    # every real consumer's correct pin and force MUNINN_ALLOW_UNPINNED=true,
+    # defeating the whole control. `github.action_ref` evaluated HERE in the
+    # step's `env:` block IS reliably populated in the composite context
+    # (the accepted real-runner workaround), and carries the exact ref the
+    # caller pinned this action at -- a 40-hex SHA for a correct pin, or a
+    # branch/tag name for an unpinned one. pr_action.resolve_action_ref()
+    # reads it first, then falls back to GITHUB_ACTION_REF, then to a SHA
+    # parsed from GITHUB_ACTION_PATH.
     - name: Run Muninn Context Receipt
       shell: bash
       run: python3 "${{ github.action_path }}/shadow/pr_action.py"
       env:
+        MUNINN_ACTION_REF: ${{ github.action_ref }}
         MUNINN_GITHUB_TOKEN: ${{ inputs.github-token }}
         MUNINN_AI_LABEL: ${{ inputs.ai-authored-label }}
         MUNINN_AI_AUTHOR_GLOB: ${{ inputs.ai-authored-author-glob }}

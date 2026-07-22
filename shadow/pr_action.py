@@ -103,6 +103,51 @@ MUNINN_VERSION = "0.1.0"
 _SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
+def resolve_action_ref(muninn_action_ref: str, github_action_ref: str,
+                       github_action_path: str) -> Tuple[str, str]:
+    """Work out the ref THIS action invocation was actually pinned at,
+    robust to a real GitHub Actions quirk: for the inner steps of a
+    COMPOSITE action the runner leaves the GITHUB_ACTION_REF env var (and
+    the `${{ github.action_ref }}` expression evaluated inside a `run:`)
+    EMPTY, even when the caller pinned `uses:` to a correct commit SHA. See
+    actions/runner#2473 / #2525. That empty value is exactly why the old
+    check forced every real consumer to set MUNINN_ALLOW_UNPINNED=true,
+    which defeats the whole supply-chain control this check exists for.
+
+    Precedence (first non-empty wins):
+      1. MUNINN_ACTION_REF -- `github.action_ref` threaded in explicitly by
+         action.yml via the step's `env:` block. Evaluating the context in
+         the `env:` field (rather than reading the raw env var or using the
+         expression inside `run:`) IS reliably populated in the composite
+         inner step -- the accepted real-runner workaround for #2473. This
+         is the primary, correct source.
+      2. GITHUB_ACTION_REF -- the runner's own env var. Correct for a
+         top-level (non-composite) invocation; empty inside composite inner
+         steps, hence not sufficient on its own.
+      3. a 40-hex commit SHA parsed out of GITHUB_ACTION_PATH -- a
+         defense-in-depth fallback. For a SHA-pinned action the runner
+         checks the action out under
+         `.../_actions/<owner>/<repo>/<sha>/...`, so the SHA appears as a
+         path segment; a branch/tag checkout has the branch/tag NAME in
+         that segment instead, never a 40-hex string, so this only ever
+         yields a value when the action was genuinely SHA-pinned.
+
+    Returns (ref, source). `ref` is "" only when none of the three yielded
+    anything -- in which case the caller keeps failing closed (see
+    check_pinned_ref); a missing ref is never silently treated as pinned.
+    `source` names which input the ref came from, for an honest job log."""
+    ref = (muninn_action_ref or "").strip()
+    if ref:
+        return ref, "MUNINN_ACTION_REF (github.action_ref, threaded via action.yml env)"
+    ref = (github_action_ref or "").strip()
+    if ref:
+        return ref, "GITHUB_ACTION_REF"
+    for segment in re.split(r"[\\/]+", github_action_path or ""):
+        if _SHA40_RE.match(segment):
+            return segment, "GITHUB_ACTION_PATH (resolved commit-SHA checkout dir)"
+    return "", "none (no ref resolvable from MUNINN_ACTION_REF, GITHUB_ACTION_REF, or GITHUB_ACTION_PATH)"
+
+
 def check_pinned_ref(action_ref: str, *, allow_unpinned: bool
                      ) -> Tuple[bool, str]:
     """The supply-chain self-check (see the HARDENING BACKLOG / stack audit
@@ -114,19 +159,23 @@ def check_pinned_ref(action_ref: str, *, allow_unpinned: bool
     could swap in different, unreviewed code for that window with no change
     to the customer's own workflow file at all.
 
-    `action_ref` is GITHUB_ACTION_REF -- the ref GitHub itself resolved for
-    THIS invocation of the action (set by the runner, not configurable by
-    the action or its inputs, so it can't be spoofed by anything short of a
-    compromised runner). Pure, no I/O, so it is trivially testable without
-    faking the environment: main() below is the only caller that reads
-    GITHUB_ACTION_REF/MUNINN_ALLOW_UNPINNED from the real environment.
+    `action_ref` is the ALREADY-RESOLVED ref for THIS invocation of the
+    action, as worked out by resolve_action_ref() from the three env
+    sources (see that function for the composite-action quirk it defends
+    against). Set by the runner, not configurable by the action's inputs,
+    so it can't be spoofed by anything short of a compromised runner. Pure,
+    no I/O, so it is trivially testable without faking the environment:
+    main() below is the only caller that resolves it from the real
+    environment (via resolve_action_ref) and reads MUNINN_ALLOW_UNPINNED.
 
     Returns (ok, message). `ok` is False (the run must fail) whenever
     `action_ref` is not a 40-character lowercase-hex commit SHA, UNLESS the
     caller has explicitly set MUNINN_ALLOW_UNPINNED=true -- an escape hatch
     for local/dev use only, never recommended for a real CI run, which is
     why it still prints the warning even when it lets the run continue."""
-    ref_label = action_ref or "(empty -- GITHUB_ACTION_REF was not set)"
+    ref_label = action_ref or ("(empty -- no ref could be resolved from "
+                               "MUNINN_ACTION_REF, GITHUB_ACTION_REF, or "
+                               "GITHUB_ACTION_PATH)")
     lines = [f"muninn-context-receipt: client version {MUNINN_VERSION}, "
             f"invoked at ref '{ref_label}'"]
     if action_ref and _SHA40_RE.match(action_ref):
@@ -281,6 +330,7 @@ def run(event: Dict[str, Any], *, workspace: str, repo: str, token: str,
        server_url: str = "", server_public_key_pem: bytes = b"",
        client_key_id: str = "", client_private_key_pem: bytes = b"",
        action_ref: str = "", allow_unpinned: bool = False,
+       ref_source: str = "",
        client_factory=GitHubClient,
        stdout=None) -> int:
     """The testable core: everything main() does, minus reading process
@@ -300,6 +350,8 @@ def run(event: Dict[str, Any], *, workspace: str, repo: str, token: str,
     warns) on every PR, not only the ones this Action would otherwise have
     acted on."""
     out = stdout or sys.stdout
+    if ref_source:
+        out.write(f"muninn-context-receipt: pinned-ref source: {ref_source}\n")
     ref_ok, ref_message = check_pinned_ref(action_ref, allow_unpinned=allow_unpinned)
     out.write(ref_message + "\n")
     if not ref_ok:
@@ -387,6 +439,17 @@ def main(argv: Optional[list] = None) -> int:
              "cleanly.")
         return 0
     event = load_event(event_path)
+    # Resolve the ref THIS invocation was pinned at, robust to the composite
+    # -action quirk where GITHUB_ACTION_REF is empty for a composite's inner
+    # steps even on a correct SHA pin (actions/runner#2473). action.yml
+    # threads `github.action_ref` in via the step's env: block as
+    # MUNINN_ACTION_REF -- the reliable source in that context. See
+    # resolve_action_ref() for the full precedence and the fallbacks.
+    resolved_ref, ref_source = resolve_action_ref(
+        os.environ.get("MUNINN_ACTION_REF", ""),
+        os.environ.get("GITHUB_ACTION_REF", ""),
+        os.environ.get("GITHUB_ACTION_PATH", ""),
+    )
     return run(
         event,
         workspace=os.environ.get("GITHUB_WORKSPACE", "."),
@@ -407,11 +470,12 @@ def main(argv: Optional[list] = None) -> int:
         client_key_id=os.environ.get("MUNINN_CLIENT_KEY_ID", ""),
         client_private_key_pem=os.environ.get(
             "MUNINN_CLIENT_PRIVATE_KEY_PEM", "").encode("utf-8"),
-        # GITHUB_ACTION_REF is set by the runner itself to the ref of THIS
-        # action invocation -- not an input, not something the calling
+        # The ref is resolved above (resolve_action_ref) from three env
+        # sources set by the runner itself -- not inputs the calling
         # workflow's `with:` block can spoof. MUNINN_ALLOW_UNPINNED is the
         # documented, not-recommended escape hatch; see check_pinned_ref().
-        action_ref=os.environ.get("GITHUB_ACTION_REF", ""),
+        action_ref=resolved_ref,
+        ref_source=ref_source,
         allow_unpinned=os.environ.get(
             "MUNINN_ALLOW_UNPINNED", "").strip().lower() == "true",
     )
