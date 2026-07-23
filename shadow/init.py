@@ -57,8 +57,8 @@ DEFAULT_ONBOARD_BRANCH = "muninn-setup"
 # all. THE ONE PLACE to bump on a future muninn-client release: update
 # MUNINN_CLIENT_REF (and its version comment) here, nowhere else -- both
 # CLIENT_ACTION_REF and the generated workflow derive from it.
-MUNINN_CLIENT_REF = "29d5e153e6cd9296fa5adcebd985f2a3ea15bf63"  # muninn-client v0.1.1 (receipt names finding + pin self-check fix)
-MUNINN_CLIENT_VERSION_LABEL = "v0.1.1"
+MUNINN_CLIENT_REF = "609e9d5163b9037bc91097d9233efd593fcea19f"  # muninn-client v0.1.2 (canonicalizer installation fix + crypto-core v2 + retro-baseline)
+MUNINN_CLIENT_VERSION_LABEL = "v0.1.2"
 CLIENT_ACTION_REF = f"bronsonaber/muninn-client@{MUNINN_CLIENT_REF}"
 WORKFLOW_RELPATH = ".github/workflows/muninn.yml"
 PRIVATE_KEY_FILENAME = ".muninn_client_key.pem"  # local only; deleted before exit

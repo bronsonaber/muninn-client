@@ -53,7 +53,8 @@ full transaction builder, which re-hashes the vault and is meant for the
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 from shadow._bundle_primitives import (  # noqa: E402
     NOT_A_CODE_REVIEW_DISCLAIMER, STATUS_NO_RISKS_FOUND,
@@ -72,7 +73,231 @@ HIDDEN_MARKER = "<!-- muninn:context-receipt:v1 -->"
 CLOSING_LINE = ("Muninn does not approve code. It shows the context risk "
                 "your reviewer should decide.")
 
-# Terminal control bytes (ANSI / C0 / C1) stripped from every rendered
+# ---------------------------------------------------------------------------
+# ANNOYANCE BUDGET (retention guardrails, Joint Council audit: "if it makes
+# PRs noisy, it loses"). Everything below this banner exists so Muninn never
+# becomes spammy: it stays silent on clean PRs, keeps ONE sticky comment per
+# PR, maps every finding's severity to EXACTLY ONE action, lets suppressions
+# expire and be audited, and guards render time. All pure, no I/O -- the
+# posting/timing/file-reading side is shadow/pr_action.py.
+# ---------------------------------------------------------------------------
+
+# Rule 3: severity maps to EXACTLY ONE recommended action. Doctor's severity
+# vocabulary (CRITICAL/HIGH/MEDIUM/LOW, plus a few synonyms) is normalized to
+# three tiers, and each tier has ONE canonical action string -- never a menu,
+# never zero. An unrecognized severity fails safe to "warning": it is surfaced
+# for a human, never silently dropped (would understate risk) and never
+# escalated to a hard block (would overstate it).
+_SEVERITY_TIERS = {
+    "CRITICAL": "blocker", "HIGH": "blocker", "BLOCKER": "blocker",
+    "MEDIUM": "warning", "WARNING": "warning", "WARN": "warning",
+    "LOW": "notice", "INFO": "notice", "NOTICE": "notice",
+}
+_TIER_ACTION = {
+    "blocker": ("Resolve before merge: a human must clear this finding before "
+                "this PR is merged."),
+    "warning": ("Review before merge: a human should confirm this is intended "
+                "before merging."),
+    "notice": "Note only: no merge action is required for this finding.",
+}
+_DEFAULT_TIER = "warning"
+
+# Rule 5: a receipt render should complete well under this. The guard only
+# MEASURES and (when egregiously over) WARNS -- it never fails a run, because a
+# slow render must never break a customer's CI. See render_budget_warning().
+RENDER_BUDGET_SECONDS = 15.0
+
+
+def severity_tier(severity: Any) -> str:
+    """Normalize a doctor severity string to one of the three annoyance-budget
+    tiers ('blocker' / 'warning' / 'notice'). Unknown/blank -> 'warning' (fail
+    safe: surfaced, never silenced, never over-escalated)."""
+    return _SEVERITY_TIERS.get(str(severity or "").strip().upper(), _DEFAULT_TIER)
+
+
+def action_for_severity(severity: Any) -> str:
+    """Rule 3: the ONE recommended action for a finding of this severity. Pure,
+    total (every input yields exactly one non-empty action), deterministic."""
+    return _TIER_ACTION[severity_tier(severity)]
+
+
+def first_look_is_actionable(first_look: Optional[Dict[str, Any]]) -> bool:
+    """Rule 1 (local mode): a first_look report is 'actionable' -- worth a PR
+    comment -- only when it carries at least one finding a reviewer must see: a
+    lead (blocker) or a review_later (warning/possible) item. A run with
+    neither is CLEAN and earns no comment."""
+    fl = first_look or {}
+    return bool(fl.get("lead")) or bool(fl.get("review_later"))
+
+
+def report_is_actionable(report: Optional[Dict[str, Any]]) -> bool:
+    """Rule 1 (local mode): convenience over a full doctor report -- reads its
+    first_look section. See first_look_is_actionable()."""
+    return first_look_is_actionable((report or {}).get("first_look") or {})
+
+
+def server_scores_are_actionable(scores: Optional[Dict[str, Any]]) -> bool:
+    """Rule 1 (server mode): a scores-v1 object is actionable when it carries a
+    high_risk pointer, a flagged pointer, or a policy collision. A bundle whose
+    every pointer scored 'clear' is CLEAN and earns no comment."""
+    if not isinstance(scores, dict):
+        return False
+    files = scores.get("files")
+    files = files if isinstance(files, list) else []
+    if any(isinstance(f, dict) and f.get("risk") in ("high_risk", "flagged")
+           for f in files):
+        return True
+    pc = scores.get("policy_collisions")
+    return bool(isinstance(pc, list) and pc)
+
+
+def server_receipt_is_actionable(receipt: Optional[Dict[str, Any]]) -> bool:
+    """Rule 1 (server mode): convenience over a verified server receipt -- reads
+    its scores object. See server_scores_are_actionable()."""
+    return server_scores_are_actionable((receipt or {}).get("scores"))
+
+
+def _parse_dt(value: Any) -> datetime:
+    """ISO-8601 -> tz-aware datetime. Accepts a trailing 'Z' (Python 3.9's
+    fromisoformat does not) and treats a naive timestamp as UTC. Raises
+    ValueError on anything unparseable -- callers here treat that as 'no
+    concrete expiry' and therefore as expired (fail safe)."""
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        s = str(value or "").strip()
+        if not s:
+            raise ValueError("empty timestamp")
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _effective_expiry(record: Dict[str, Any]) -> Optional[datetime]:
+    """A suppression's concrete expiry instant, from either an explicit
+    `expires` ISO timestamp or a `created` + `ttl_days` pair. Returns None when
+    neither is resolvable -- a suppression with no computable expiry is invalid
+    and never suppresses (Rule 4: suppressions MUST expire; an open-ended one
+    is not allowed)."""
+    if not isinstance(record, dict):
+        return None
+    try:
+        if record.get("expires"):
+            return _parse_dt(record["expires"])
+        created = record.get("created")
+        ttl_days = record.get("ttl_days")
+        if created and ttl_days is not None:
+            return _parse_dt(created) + timedelta(days=float(ttl_days))
+    except (ValueError, TypeError):
+        return None
+    return None
+
+
+def suppression_expiry_iso(record: Dict[str, Any]) -> str:
+    """The effective expiry as an ISO string for the audit log, or '' when the
+    record has no computable expiry."""
+    exp = _effective_expiry(record)
+    return exp.isoformat() if exp is not None else ""
+
+
+def suppression_active(record: Dict[str, Any], now: Any) -> bool:
+    """Rule 4: a suppression suppresses a finding ONLY inside its TTL window.
+    Past its expiry -- or with a missing/malformed TTL -- it is INACTIVE: the
+    finding resurfaces. Fails safe, so a suppression can never silence a
+    finding forever."""
+    try:
+        now_dt = _parse_dt(now)
+    except (ValueError, TypeError):
+        return False
+    expires = _effective_expiry(record)
+    if expires is None:
+        return False
+    return now_dt < expires
+
+
+def _finding_key(f: Dict[str, Any]) -> Optional[str]:
+    """The stable identity a suppression targets: a local finding's finding_id,
+    or a server pointer's `pointer`."""
+    if not isinstance(f, dict):
+        return None
+    key = f.get("finding_id") or f.get("pointer")
+    return str(key) if key else None
+
+
+def partition_suppressed(findings: List[Dict[str, Any]],
+                         suppressions: List[Dict[str, Any]],
+                         now: Any) -> Tuple[List[Dict[str, Any]],
+                                            List[Dict[str, Any]]]:
+    """Rule 4: split `findings` into (kept, audit). A finding is dropped only
+    when an ACTIVE suppression targets its key (finding_id or pointer). Every
+    suppression that MATCHED a finding is recorded in `audit` with its status
+    ('applied' while active, 'expired' once past TTL) so the whole decision is
+    visible -- an expired suppression is reported AND its finding is kept
+    (resurfaced), never silently honored. Pure: `now` is passed in, never
+    read from the clock here."""
+    kept: List[Dict[str, Any]] = []
+    audit: List[Dict[str, Any]] = []
+    by_target: Dict[str, Dict[str, Any]] = {}
+    for s in (suppressions or []):
+        if isinstance(s, dict) and s.get("target"):
+            by_target.setdefault(str(s["target"]), s)
+    recorded: set = set()
+    for f in (findings or []):
+        key = _finding_key(f)
+        supp = by_target.get(key) if key is not None else None
+        if supp is None:
+            kept.append(f)
+            continue
+        active = suppression_active(supp, now)
+        if key not in recorded:
+            audit.append({
+                "target": key,
+                "reason": str(supp.get("reason", "")),
+                "status": "applied" if active else "expired",
+                "expires": suppression_expiry_iso(supp),
+            })
+            recorded.add(key)
+        if active:
+            continue  # dropped: an active suppression hides this finding
+        kept.append(f)  # expired suppression -> finding resurfaces
+    return kept, audit
+
+
+def render_budget_warning(elapsed_seconds: Any) -> str:
+    """Rule 5: a one-line warning when a render ran over RENDER_BUDGET_SECONDS,
+    else ''. NON-BLOCKING -- the caller logs this and keeps going. Only an
+    egregiously slow render is worth a human's attention; this surfaces it
+    without ever failing the run."""
+    try:
+        e = float(elapsed_seconds)
+    except (TypeError, ValueError):
+        return ""
+    if e > RENDER_BUDGET_SECONDS:
+        return (f"receipt render took {e:.2f}s, over the "
+                f"{RENDER_BUDGET_SECONDS:.0f}s soft budget; not failing the "
+                f"run, but this is worth investigating.")
+    return ""
+
+
+def render_resolved_receipt() -> str:
+    """Rule 1 + Rule 2: the minimal sticky-comment body for a PR that USED to
+    carry a Muninn finding but is CLEAN on the latest commit. Muninn never
+    posts a NEW comment for a clean PR, but when a prior Muninn comment already
+    exists it edits that one in place rather than leaving a stale finding
+    standing -- one sticky comment per PR, kept honest, never a spam trail.
+    Carries the same HIDDEN_MARKER so the same upsert lookup still finds it,
+    ends on the mandated closing line, and never uses a blessing phrase."""
+    L = [HIDDEN_MARKER, "", "## Muninn Context Receipt", "",
+         _safe(NOT_A_CODE_REVIEW_DISCLAIMER), "",
+         "### No actionable context risk on the latest commit",
+         "A previous Muninn finding on this PR no longer applies to the "
+         "current commit. This is not an approval, only the absence of an "
+         "actionable finding in what was scanned.", "",
+         CLOSING_LINE]
+    return "\n".join(L) + "\n"
 # string, same guard shadow/doctor.py applies to its own terminal output
 # (_term_safe) -- a crafted memory id/title must not smuggle escape
 # sequences or zero-width tricks into a PUBLIC PR comment.
@@ -141,7 +366,11 @@ def _finding_lines(f: Dict[str, Any]) -> List[str]:
     sev = _safe(f.get("severity", ""))
     conf = _safe(f.get("confidence", ""))
     title = _safe(f.get("title", ""))
-    action = _safe(f.get("recommended_fix") or "manual review required")
+    # Rule 3: exactly ONE reviewer action per finding -- the finding's own
+    # recommended_fix when it has one, otherwise the single severity-mapped
+    # action. Never empty, never a menu.
+    action = (_safe(f.get("recommended_fix") or "")
+              or action_for_severity(f.get("severity")))
     evidence = f.get("evidence") or []
     lines = [f"- **[{sev} / {conf} confidence]** {title}"]
     if evidence:
